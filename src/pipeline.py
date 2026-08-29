@@ -65,13 +65,21 @@ def run_trial(
     summary = steps.cadence_summary(det["step_times_s"])
     cadence = steps.cadence_series(det["step_times_s"])
     spectral = steps.estimate_step_frequency(a_vert, fs)
+    # `fs` is an input assertion, so test it against the data before any
+    # cadence is attributed to the runner: two estimators sharing a wrong
+    # rate agree with each other while both being wrong.
+    rate_check = steps.check_sample_rate(a_vert, fs)
     diag = steps.diagnose_cadence(
         detected_spm=summary["cadence_spm"],
         spectral_spm=spectral["cadence_spm"],
         stride_regularity=verify["periodicity"]["stride_regularity"],
         irregular_step_fraction=summary["irregular_step_fraction"],
+        sample_rate_plausible=rate_check["sample_rate_plausible"],
+        out_of_band_peak_hz=rate_check["out_of_band_peak_hz"],
     )
-    if too_short:
+    # `cadence_summary` already enforces MIN_STEADY_SECONDS on the step
+    # span; this adds the segment-level context to the message.
+    if too_short and rate_check["sample_rate_plausible"]:
         diag = dict(diag)
         diag["flagged"] = True
         diag["failure_attributed_to"] = "trial"
@@ -98,6 +106,7 @@ def run_trial(
         "cadence_series": cadence,
         "spectral": spectral,
         "cadence_diagnosis": diag,
+        "sample_rate_check": rate_check,
         "lateral": lat,
     }
 
@@ -151,11 +160,13 @@ def flatten(result: dict) -> dict:
         "cadence_spm_spectral": result["spectral"]["cadence_spm"],
         "cadence_cv": cs["cadence_cv"],
         "irregular_step_fraction": cs["irregular_step_fraction"],
-        "alternating_interval_asymmetry_pct": cs["alternating_interval_asymmetry_pct"],
+        "alternating_interval_asymmetry_abs_pct": cs["alternating_interval_asymmetry_abs_pct"],
         "cadence_in_band": cd["cadence_in_expected_band"],
         "detector_spectral_ratio": cd["detector_spectral_ratio"],
         "cadence_flagged": cd["flagged"],
         "cadence_failure_cause": cd["failure_attributed_to"],
+        "sample_rate_plausible": cd["sample_rate_plausible"],
+        "span_too_short": cs["span_too_short"],
         "cadence_diagnosis": cd["diagnosis"],
         # stage 4 (exploratory; no ground truth)
         "n_labelled_steps": lat["n_labelled_steps"],

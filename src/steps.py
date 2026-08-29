@@ -84,9 +84,19 @@ MIN_PEAK_DISTANCE_STEP_PERIODS = 0.6
 # Peak prominence as a multiple of the robust (MAD-based) sigma of the
 # filtered trace. 0.5 sigma accepts the weaker step of an asymmetric pair
 # -- essential here, where the two steps of a stride differ substantially
-# -- while rejecting ripple. Raising it to 1.5 tripled the disagreement
-# with the spectral cadence estimate by starting to drop alternate steps.
+# -- while rejecting ripple. Raising it to 1.5 multiplied the disagreement
+# with the spectral cadence estimate by 5 by starting to drop alternate steps.
 PEAK_PROMINENCE_SIGMA = 0.5
+# Below this ratio of robust sigma to the segment's own peak amplitude,
+# the trace carries no variation and there is nothing to detect. A constant
+# input makes robust sigma exactly 0, which would otherwise set the
+# prominence threshold to 0 -- maximally permissive at the precise moment
+# the signal is empty -- and `find_peaks` would return every local maximum
+# in filtfilt's numerical noise (~47 "steps" from `np.ones(1000)`).
+# 1e-9 sits many orders above double-precision filter noise (~1e-16 of the
+# input scale) and many orders below any real signal, where the ratio is
+# order 0.1-0.5.
+DEGENERATE_SIGMA_FRACTION = 1e-9
 
 # --- cadence validation --------------------------------------------------
 
@@ -101,6 +111,16 @@ HARMONIC_ERROR_TOLERANCE = 0.15
 # Below this stride regularity the trace is not steady running, so no
 # cadence claim -- of any kind -- is defensible.
 MIN_STRIDE_REGULARITY = 0.30
+# Sample-rate plausibility. If more spectral power sits OUTSIDE the
+# plausible human step band than at the strongest peak inside it, the real
+# gait fundamental is not where `fs_hz` says it is, and the rate is the
+# prime suspect. Measured on this dataset: across all 48 trials at the
+# correct rate the out-of-band / in-band peak-power ratio never exceeds
+# 0.435 (the second harmonic is always weaker than the fundamental), while
+# claiming 100 Hz for 50 Hz data gives 15.1 and claiming 200 Hz gives 1002.
+# 1.0 sits in that empty gap and is also the natural physical boundary:
+# more power outside the human band than inside it.
+SAMPLE_RATE_OUT_OF_BAND_RATIO = 1.0
 
 
 def steady_state_segment(
@@ -184,6 +204,58 @@ def estimate_step_frequency(a_vert: np.ndarray, fs_hz: float) -> dict:
     }
 
 
+def check_sample_rate(
+    a_vert: np.ndarray,
+    fs_hz: float,
+    band: tuple[float, float] = dsp.STEP_FREQ_SEARCH_BAND_HZ,
+) -> dict:
+    """Is `fs_hz` consistent with the data, or is the rate probably wrong?
+
+    `fs_hz` is an input assertion: nothing in a bare array of samples states
+    the rate it was captured at, and getting it wrong rescales every result
+    linearly. The failure is quiet and dangerous, because the step-frequency
+    search band clamps the estimate back into a plausible-looking range --
+    50 Hz data presented as 200 Hz yields ~206 spm rather than an obviously
+    absurd number, and the two cadence estimators then *agree with each
+    other* because they share the same wrong rate.
+
+    The test compares the strongest spectral peak inside the plausible human
+    step band against the strongest peak outside it. Under a correct rate
+    the fundamental dominates and the ratio is well below 1; under an
+    overstated rate the real fundamental is pushed above the band and the
+    ratio explodes.
+
+    Known blind spot, stated rather than papered over: **understating the
+    rate by about 2x is undetectable here**, because it moves a 2.7 Hz
+    fundamental to 1.36 Hz, which is still inside the human band and is
+    genuinely indistinguishable from a slow walker. This check catches
+    overstatement and gross understatement only.
+    """
+    pk = dsp.spectral_peak(a_vert, fs_hz, band)
+    f, p = pk["freqs"], pk["psd"]
+    in_band = (f >= band[0]) & (f <= band[1])
+    out_band = (~in_band) & (f > 0)
+
+    in_peak = float(p[in_band].max()) if in_band.any() else 0.0
+    if out_band.any():
+        j = int(np.argmax(p[out_band]))
+        out_peak = float(p[out_band][j])
+        out_hz = float(f[out_band][j])
+    else:
+        out_peak, out_hz = 0.0, float("nan")
+
+    ratio = out_peak / in_peak if in_peak > 0 else float("inf")
+    return {
+        "in_band_peak_hz": float(pk["f_peak_hz"]),
+        "in_band_peak_power": in_peak,
+        "out_of_band_peak_hz": out_hz,
+        "out_of_band_peak_power": out_peak,
+        "out_of_band_ratio": float(ratio),
+        "sample_rate_plausible": bool(ratio <= SAMPLE_RATE_OUT_OF_BAND_RATIO),
+        "fs_hz": float(fs_hz),
+    }
+
+
 def bandpass_for_steps(
     a_vert: np.ndarray, fs_hz: float, f_step_hz: float
 ) -> tuple[np.ndarray, tuple[float, float]]:
@@ -229,7 +301,24 @@ def detect_steps(
     distance = max(1, int(round(MIN_PEAK_DISTANCE_STEP_PERIODS / f_step_hz * fs_hz)))
     prominence = PEAK_PROMINENCE_SIGMA * sigma
 
-    idx, props = signal.find_peaks(filtered, distance=distance, prominence=prominence)
+    # A degenerate trace is "no signal", never "accept every peak".
+    #
+    # The reference scale is the *input* amplitude, not the filtered trace's.
+    # Comparing the filtered trace against itself is circular: on a constant
+    # input the band-pass output and its robust sigma are both ~1e-16, so
+    # their ratio is order 1 and nothing looks wrong. Measured against the
+    # input, a constant gives sigma/scale ~ 1e-16 while any real signal gives
+    # order 0.1-0.5.
+    #
+    # Written as `not (sigma > threshold)` so a NaN sigma also lands here:
+    # `nan > x` is False.
+    scale = float(np.max(np.abs(a_vert))) if a_vert.size else 0.0
+    degenerate = not (sigma > DEGENERATE_SIGMA_FRACTION * scale)
+    if degenerate:
+        idx = np.empty(0, dtype=int)
+        props: dict = {}
+    else:
+        idx, props = signal.find_peaks(filtered, distance=distance, prominence=prominence)
     times = idx / fs_hz + t0_s
     intervals = np.diff(times)
 
@@ -245,6 +334,9 @@ def detect_steps(
         "min_distance_samples": int(distance),
         "peak_prominences": props.get("prominences", np.array([])),
         "n_steps": int(len(idx)),
+        # True when the trace carried no variation to detect steps in, as
+        # distinct from a live trace in which no peak cleared the threshold.
+        "degenerate_signal": bool(degenerate),
     }
 
 
@@ -286,21 +378,34 @@ def cadence_series(
     return df
 
 
-def cadence_summary(step_times_s: np.ndarray) -> dict:
-    """Whole-trial cadence statistics from detected step times."""
+def cadence_summary(
+    step_times_s: np.ndarray, min_span_s: float = MIN_STEADY_SECONDS
+) -> dict:
+    """Whole-trial cadence statistics from detected step times.
+
+    The short-record guard lives here, not in the pipeline, because this is
+    the one function every entry point goes through to obtain a cadence.
+    Enforcing it further up left `scripts/run_invariance_checks.py` and
+    `tests/test_invariance.py` free to report a confident 162.79 spm from a
+    3 s record. Below `min_span_s` the cadence is NaN, the same way it
+    already is below three steps: not a number, so nothing downstream can
+    quietly treat it as one.
+    """
     t = np.asarray(step_times_s, float)
-    if len(t) < 3:
+    span_now = float(t[-1] - t[0]) if len(t) > 1 else 0.0
+    if len(t) < 3 or span_now < min_span_s:
         return {
             "n_steps": int(len(t)),
             "cadence_spm": np.nan,
             "cadence_spm_median": np.nan,
             "cadence_cv": np.nan,
             "irregular_step_fraction": np.nan,
-            "alternating_interval_asymmetry_pct": np.nan,
-            "span_s": float(t[-1] - t[0]) if len(t) > 1 else 0.0,
+            "alternating_interval_asymmetry_abs_pct": np.nan,
+            "span_s": span_now,
+            "span_too_short": bool(span_now < min_span_s),
         }
     intervals = np.diff(t)
-    span = float(t[-1] - t[0])
+    span = span_now
     # Rate over the whole span rather than the mean of per-interval
     # cadences: robust to a few outlier intervals, and the quantity a
     # step counter would report.
@@ -312,24 +417,30 @@ def cadence_summary(step_times_s: np.ndarray) -> dict:
     # those two failure modes.
     irregular = float(np.mean(np.abs(intervals - med) > 0.25 * med))
 
-    # Alternating-interval asymmetry: the signed difference between the two
+    # Alternating-interval asymmetry: the difference between the two
     # interleaved sets of step intervals, as a percentage of the mean
-    # interval.
+    # interval. Reported as an ABSOLUTE value.
+    #
+    # The sign is meaningless and is therefore discarded. Which interleaved
+    # set is "even" depends entirely on which step happens to land at index
+    # 0, which is set by where detection started -- so a signed value would
+    # flip on a one-step change in the trim boundary while describing the
+    # identical gait.
     #
     # READ THIS AS A DETECTOR DIAGNOSTIC, NOT AS THE RUNNER'S STEP-TIME
     # SYMMETRY. When the two steps of a stride produce differently shaped
     # vertical waveforms -- which they do at a pocket, strongly -- the crest
     # of the band-passed fundamental shifts by a different amount on
     # alternate steps, so the detected timestamps alternate short-long even
-    # if the runner's true step times do not. On this dataset the magnitude
-    # of this quantity correlates at r = -0.91 with the amplitude-domain
-    # step symmetry index, which is what that artifact looks like. Values
-    # here reach +/-30%, far beyond the 1-3% real runners show.
+    # if the runner's true step times do not. On this dataset this quantity
+    # correlates at r = -0.91 with the amplitude-domain step symmetry index,
+    # which is what that artifact looks like. Values here reach 32%, far
+    # beyond the 1-3% real runners show.
     even, odd = intervals[0::2], intervals[1::2]
     n = min(len(even), len(odd))
     if n >= 2:
         asym = float(
-            100.0 * (even[:n].mean() - odd[:n].mean()) / np.mean(intervals)
+            100.0 * abs(even[:n].mean() - odd[:n].mean()) / np.mean(intervals)
         )
     else:
         asym = np.nan
@@ -340,8 +451,9 @@ def cadence_summary(step_times_s: np.ndarray) -> dict:
         "cadence_spm_median": float(60.0 / med),
         "cadence_cv": float(np.std(intervals) / np.mean(intervals)),
         "irregular_step_fraction": irregular,
-        "alternating_interval_asymmetry_pct": asym,
+        "alternating_interval_asymmetry_abs_pct": asym,
         "span_s": span,
+        "span_too_short": False,
     }
 
 
@@ -351,20 +463,50 @@ def diagnose_cadence(
     stride_regularity: float,
     irregular_step_fraction: float,
     expected: tuple[float, float] = EXPECTED_CADENCE_SPM,
+    sample_rate_plausible: bool = True,
+    out_of_band_peak_hz: float | None = None,
 ) -> dict:
-    """Flag out-of-band cadence and attribute it to the algorithm or the trial.
+    """Flag out-of-band cadence and attribute the cause.
 
-    The attribution rests on having two estimators that share no machinery:
-    peak counting and the spectral peak. If they agree, the detector is
-    doing its job and an out-of-band number is a fact about the trial. If
-    they disagree, the detector is at fault -- and the ratio between them
-    says how.
+    Four outcomes: "none", "sample_rate", "algorithm", "trial".
+
+    The algorithm-vs-trial attribution rests on having two estimators that
+    share no machinery: peak counting and the spectral peak. If they agree,
+    the detector is doing its job and an out-of-band number is a fact about
+    the trial. If they disagree, the detector is at fault -- and the ratio
+    between them says how.
+
+    That reasoning has one precondition, which is why `sample_rate_plausible`
+    is checked *first*: the two estimators share the sample rate. Given a
+    wrong `fs_hz` they agree with each other while both being wrong
+    together, and their agreement was previously read as evidence about the
+    runner -- reporting a rate error as "the runner's cadence really is
+    outside 150-190 spm". Agreement under a shared wrong assumption is not
+    evidence. Pass the verdict from `check_sample_rate` to keep that
+    distinction.
     """
     in_band = bool(expected[0] <= detected_spm <= expected[1])
     ratio = detected_spm / spectral_spm if spectral_spm > 0 else np.nan
     agree = bool(abs(ratio - 1.0) <= DETECTOR_SPECTRAL_TOLERANCE)
 
-    if stride_regularity < MIN_STRIDE_REGULARITY:
+    if not sample_rate_plausible:
+        cause = "sample_rate"
+        where = (
+            f" (strongest power sits at {out_of_band_peak_hz:.2f} Hz, outside the "
+            f"plausible step band)" if out_of_band_peak_hz is not None else ""
+        )
+        detail = (
+            f"the sample rate is probably wrong{where}. Both cadence estimators "
+            f"share fs_hz, so their agreement says nothing about the runner here. "
+            f"Check the rate before reading this cadence."
+        )
+    elif not np.isfinite(detected_spm):
+        cause = "trial"
+        detail = (
+            "no defensible cadence: fewer than three steps, or a step span "
+            f"shorter than {MIN_STEADY_SECONDS:g}s"
+        )
+    elif stride_regularity < MIN_STRIDE_REGULARITY:
         cause = "trial"
         detail = (
             f"stride regularity {stride_regularity:.2f} < {MIN_STRIDE_REGULARITY}: "
@@ -404,7 +546,9 @@ def diagnose_cadence(
         "cadence_in_expected_band": in_band,
         "detector_spectral_ratio": float(ratio),
         "detector_agrees_with_spectrum": agree,
-        "failure_attributed_to": cause,  # "none" | "algorithm" | "trial"
+        "sample_rate_plausible": bool(sample_rate_plausible),
+        # "none" | "sample_rate" | "algorithm" | "trial"
+        "failure_attributed_to": cause,
         "diagnosis": detail,
-        "flagged": bool(not in_band or not agree),
+        "flagged": bool(not in_band or not agree or not sample_rate_plausible),
     }

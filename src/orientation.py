@@ -94,8 +94,25 @@ class AnatomicalFrame:
 
 
 def unit_gravity(gravity: np.ndarray) -> np.ndarray:
-    """Per-sample unit gravity direction, (n,3)."""
+    """Per-sample unit gravity direction, (n,3).
+
+    Policy: unusable gravity **raises**, it never returns a flagged value.
+    Both guards below follow that rule. The vertical axis is the one thing
+    every later stage takes on trust -- steps, cadence and omega_v are all
+    projections onto it -- so a frame that cannot be defined must stop the
+    computation rather than seed NaN into every downstream number.
+
+    The finiteness guard is not redundant with the zero-norm guard: a NaN
+    norm compares False against 0, so all-NaN gravity would otherwise pass
+    `n == 0` untouched and propagate NaN silently through the whole frame.
+    """
     g = np.asarray(gravity, dtype=float)
+    if g.size and not np.all(np.isfinite(g)):
+        n_bad = int((~np.isfinite(g)).sum())
+        raise ValueError(
+            f"non-finite gravity: {n_bad} of {g.size} components are NaN or inf; "
+            f"cannot define vertical"
+        )
     n = np.linalg.norm(g, axis=1, keepdims=True)
     if np.any(n == 0):
         raise ValueError("zero-length gravity sample; cannot define vertical")
@@ -153,14 +170,29 @@ def project_horizontal(vectors: np.ndarray, up: np.ndarray) -> np.ndarray:
     return v - np.outer(v @ up, up)
 
 
-def _principal_axis_2d(m: np.ndarray) -> tuple[np.ndarray, float]:
-    """Principal eigenvector of a 2x2 symmetric matrix, plus eigenvalue ratio."""
+def _principal_axis_2d(m: np.ndarray, rel_tol: float = 1e-12) -> tuple[np.ndarray, float]:
+    """Principal eigenvector of a 2x2 symmetric matrix, plus eigenvalue ratio.
+
+    A non-positive or numerically negligible secondary eigenvalue means the
+    horizontal power matrix is rank-deficient: there is no second axis for
+    the first to be dominant *over*. The ratio is then **undefined**, not
+    infinite, and NaN is returned deliberately -- it compares False against
+    every `>=`, so `well_conditioned` comes out False. Returning `inf` here
+    inverted the semantics, passing the conditioning check for exactly the
+    degenerate input that check exists to reject.
+
+    `rel_tol` is relative to the leading eigenvalue, so the test scales with
+    the signal's power and catches a secondary eigenvalue that is positive
+    only through floating-point noise. An all-zero matrix makes both
+    eigenvalues 0 and is caught by the same comparison.
+    """
     w, v = np.linalg.eigh(m)
     order = np.argsort(w)[::-1]
     w = w[order]
     v = v[:, order]
-    ratio = float(w[0] / w[1]) if w[1] > 0 else np.inf
-    return v[:, 0], ratio
+    if not np.isfinite(w).all() or w[1] <= rel_tol * abs(w[0]):
+        return v[:, 0], float("nan")
+    return v[:, 0], float(w[0] / w[1])
 
 
 def forward_axis(

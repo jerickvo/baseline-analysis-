@@ -18,14 +18,20 @@ from pathlib import Path
 import matplotlib
 
 matplotlib.use("Agg")
+import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src import loader, pipeline, plotting  # noqa: E402
+from src import lateral, loader, pipeline, plotting  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 OUT = REPO / "reports"
+
+# Number of sampling offsets `lateral.phase_sweep` tries. Read from the
+# module rather than repeated, so the chance rates below stay correct if the
+# sweep resolution changes.
+N_PHASE_OFFSETS = lateral.phase_sweep.__defaults__[-1]
 
 
 def main() -> int:
@@ -147,8 +153,28 @@ def print_verdicts(t: pd.DataFrame) -> None:
         d = (piv[cols[0]] - piv[cols[1]]).abs()
         print(f"\n[reproducibility] same subject, trial {cols[0]} vs {cols[1]}")
         print(f"  |cadence difference|             median {d.median():.1f} spm, max {d.max():.1f} spm")
+
+        # Best-phase agreement, reported at two tolerances.
+        #
+        # Exact-bin equality alone understates reproducibility badly: the
+        # sweep quantises the step period into N_PHASE_OFFSETS bins, so two
+        # genuinely matching phases that straddle a bin boundary score as a
+        # miss. The within-one-bin figure is the honest headline, and both
+        # are printed against their chance rates so neither can be read as
+        # impressive or as dismal without the baseline beside it.
         po = t.pivot_table(index="subject", columns="trial", values="best_phase_offset")
-        print(f"  best-phase offset agrees         {int((po[cols[0]] == po[cols[1]]).sum())}/{len(po)} subjects")
+        n_sub = len(po)
+        delta = (po[cols[0]] - po[cols[1]]).abs()
+        circular = np.minimum(delta, 1.0 - delta)  # the phase axis wraps
+        bin_w = 1.0 / N_PHASE_OFFSETS
+        exact = int((circular < 1e-9).sum())
+        within = int((circular <= bin_w + 1e-9).sum())
+        print(f"  best-phase offset, exact bin     {exact}/{n_sub} subjects "
+              f"(chance {n_sub / N_PHASE_OFFSETS:.1f})")
+        print(f"  ... within one bin (+/-{bin_w:.1f} step) {within}/{n_sub} subjects "
+              f"(chance {3 * n_sub / N_PHASE_OFFSETS:.1f})")
+        print(f"  median circular disagreement     {circular.median():.2f} of a step "
+              f"(one bin = {bin_w:.2f}, the sweep's resolution floor)")
 
 
 if __name__ == "__main__":

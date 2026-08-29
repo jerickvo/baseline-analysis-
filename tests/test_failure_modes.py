@@ -42,27 +42,30 @@ def test_robust_sigma_of_constant_is_zero():
     assert dsp.robust_sigma(np.ones(1000)) == 0.0
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: robust_sigma of a constant signal is 0, so the peak "
-    "prominence threshold becomes 0 and find_peaks accepts every local "
-    "maximum in filtfilt's numerical noise. A constant input yields ~47 "
-    "'steps' with no error or warning.",
-)
 def test_constant_signal_detects_no_steps():
-    n_steps = steps.detect_steps(np.ones(1000), FS_HZ, F_STEP_HZ)["n_steps"]
-    assert n_steps == 0, f"constant signal produced {n_steps} spurious steps"
+    """FIXED: a zero robust sigma is 'no signal', not a permissive threshold."""
+    det = steps.detect_steps(np.ones(1000), FS_HZ, F_STEP_HZ)
+    assert det["n_steps"] == 0, f"constant signal produced {det['n_steps']} steps"
+    assert det["degenerate_signal"] is True
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: _principal_axis_2d returns np.inf when the secondary "
-    "eigenvalue is <= 0, and inf >= FORWARD_CONDITIONING_MIN_RATIO, so a "
-    "rank-deficient (information-free) input is reported as perfectly "
-    "well-conditioned. The semantics are inverted for exactly the input "
-    "the check exists to reject.",
-)
+def test_degenerate_flag_distinguishes_no_signal_from_no_peaks():
+    """A live trace with no qualifying peak is not the same as a dead one."""
+    live = steps.detect_steps(np.sin(2 * np.pi * F_STEP_HZ * _t()), FS_HZ, F_STEP_HZ)
+    assert live["degenerate_signal"] is False and live["n_steps"] > 0
+
+
+@pytest.mark.parametrize("amplitude", [1e-30, 1e-12, 1.0, 1e6])
+def test_degenerate_check_is_scale_free(amplitude):
+    """The no-signal test must not fire on a real but tiny signal."""
+    x = amplitude * np.sin(2 * np.pi * F_STEP_HZ * _t())
+    det = steps.detect_steps(x, FS_HZ, F_STEP_HZ)
+    assert det["degenerate_signal"] is False
+    assert abs(det["n_steps"] - int(DURATION_S * F_STEP_HZ)) <= 2
+
+
 def test_degenerate_horizontal_accel_is_not_well_conditioned():
+    """FIXED: a rank-deficient horizontal matrix has an undefined ratio."""
     est = orientation.forward_axis(
         np.ones((1000, 3)), np.array([0.0, 0.0, 1.0]), FS_HZ, method="pca"
     )
@@ -89,28 +92,27 @@ def test_zero_gravity_raises_rather_than_returning_nonsense():
 # --- NaN input ------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: unit_gravity guards only against a zero norm. NaN norms "
-    "are not equal to 0, so an all-NaN gravity column passes the guard and "
-    "returns NaN, propagating silently through the whole frame. No stage "
-    "checks for non-finite input; only the loader counts NaNs, and nothing "
-    "acts on that count.",
-)
 def test_nan_gravity_is_rejected():
-    with pytest.raises((ValueError, FloatingPointError)):
+    """FIXED: unusable gravity raises, consistently with the zero-norm guard."""
+    with pytest.raises(ValueError, match="non-finite gravity"):
         orientation.unit_gravity(np.full((100, 3), np.nan))
+    with pytest.raises(ValueError, match="non-finite gravity"):
+        orientation.vertical_axis(np.full((100, 3), np.nan))
+    # a single bad sample is enough to refuse the whole frame
+    g = np.tile(np.array([0.0, 0.0, 1.0]), (100, 1))
+    g[57, 1] = np.inf
+    with pytest.raises(ValueError, match="non-finite gravity"):
+        orientation.unit_gravity(g)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: spectral_peak on an all-NaN signal returns the lowest bin "
-    "of the search band (1.25 Hz = 75 spm) as a confident estimate instead "
-    "of refusing. argmax over an all-NaN array returns index 0.",
-)
 def test_nan_signal_spectral_peak_is_rejected():
-    with pytest.raises((ValueError, FloatingPointError)):
+    """FIXED: no finite samples means no defensible dominant frequency."""
+    with pytest.raises(ValueError, match="non-finite"):
         dsp.spectral_peak(np.full(1000, np.nan), FS_HZ)
+    x = np.sin(2 * np.pi * F_STEP_HZ * _t())
+    x[123] = np.nan
+    with pytest.raises(ValueError, match="non-finite"):
+        dsp.spectral_peak(x, FS_HZ)
 
 
 def test_nan_signal_detects_no_steps():
@@ -189,14 +191,13 @@ def test_harmonic_signal_gives_the_fundamental_cadence():
 # --- short records --------------------------------------------------------
 
 
-def test_min_steady_seconds_is_enforced_only_by_the_pipeline():
-    """Documents where the short-record guard lives, and where it does not.
+def test_min_steady_seconds_is_enforced_at_every_entry_point():
+    """FIXED: the short-record guard lives in `cadence_summary`.
 
-    `pipeline.run_trial` sets `steady_too_short` and overrides the cadence
-    diagnosis below MIN_STEADY_SECONDS. The stage-level functions have no
-    such guard, so a caller assembling stages directly -- as
-    `scripts/run_invariance_checks.py` and `tests/test_invariance.py` both
-    do -- gets a confident cadence from a 3 s record with no flag.
+    Every entry point -- `pipeline.run_trial`, `scripts/run_invariance_
+    checks.py` and `tests/test_invariance.py` -- reaches a cadence through
+    this one function, so putting the guard here means none of them can
+    report a confident number from a 3 s record.
     """
     tr = loader.load_trial("jog", 9, 1)
     n = int(3.0 * tr.fs_hz)
@@ -206,15 +207,25 @@ def test_min_steady_seconds_is_enforced_only_by_the_pipeline():
     f0 = steps.estimate_step_frequency(a_vert, tr.fs_hz)["f_step_hz"]
     det = steps.detect_steps(a_vert, tr.fs_hz, f0)
     summary = steps.cadence_summary(det["step_times_s"])
+
+    assert 3.0 < steps.MIN_STEADY_SECONDS
+    assert summary["span_too_short"] is True
+    assert np.isnan(summary["cadence_spm"]), "3 s record still reports a cadence"
+
     diag = steps.diagnose_cadence(
         summary["cadence_spm"], 60 * f0, 0.64, summary["irregular_step_fraction"]
     )
+    assert diag["flagged"] is True
+    assert diag["failure_attributed_to"] == "trial"
 
-    assert 3.0 < steps.MIN_STEADY_SECONDS
-    # The stage path reports an unflagged, in-band cadence from 3 seconds.
+
+def test_a_long_enough_record_is_not_flagged_short():
+    tr = loader.load_trial("jog", 9, 1)
+    a_vert = orientation.vertical_component(tr.user_accel, tr.gravity)
+    det = steps.detect_steps(a_vert, tr.fs_hz)
+    summary = steps.cadence_summary(det["step_times_s"])
+    assert summary["span_too_short"] is False
     assert np.isfinite(summary["cadence_spm"])
-    assert diag["flagged"] is False
-    assert diag["failure_attributed_to"] == "none"
 
 
 def test_cadence_summary_degrades_cleanly_below_three_steps():
@@ -259,23 +270,52 @@ def test_wrong_sample_rate_scales_the_answer_undetectably():
     assert lied > 190, "a 4x rate lie should at least leave the expected band"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: diagnose_cadence attributes a sample-rate error to the "
-    "trial. Both estimators are computed under the same wrong fs, so they "
-    "agree with each other, and the out-of-band result is reported as "
-    "'the runner's cadence really is outside 150-190 spm'. Agreement "
-    "between two estimators sharing a wrong fs is not evidence about the "
-    "runner.",
-)
 def test_rate_error_is_not_blamed_on_the_trial():
+    """FIXED: a wrong fs is attributed to the rate, not to the runner."""
     tr = loader.load_trial("jog", 9, 1)
     a_vert = orientation.vertical_component(tr.user_accel, tr.gravity)
     f0 = steps.estimate_step_frequency(a_vert, 200.0)["f_step_hz"]
     det = steps.detect_steps(a_vert, 200.0, f0)
     summary = steps.cadence_summary(det["step_times_s"])
-    diag = steps.diagnose_cadence(summary["cadence_spm"], 60 * f0, 0.85, summary["irregular_step_fraction"])
-    assert diag["failure_attributed_to"] != "trial"
+    check = steps.check_sample_rate(a_vert, 200.0)
+    assert check["sample_rate_plausible"] is False
+    diag = steps.diagnose_cadence(
+        summary["cadence_spm"], 60 * f0, 0.85, summary["irregular_step_fraction"],
+        sample_rate_plausible=check["sample_rate_plausible"],
+        out_of_band_peak_hz=check["out_of_band_peak_hz"],
+    )
+    assert diag["failure_attributed_to"] == "sample_rate"
+    assert diag["flagged"] is True
+
+
+@pytest.mark.parametrize("claimed_fs", [100.0, 200.0, 400.0])
+def test_overstated_sample_rate_is_detected(claimed_fs):
+    tr = loader.load_trial("jog", 9, 1)
+    a_vert = orientation.vertical_component(tr.user_accel, tr.gravity)
+    assert steps.check_sample_rate(a_vert, claimed_fs)["sample_rate_plausible"] is False
+
+
+def test_correct_sample_rate_is_never_flagged():
+    """The check must not fire on any real trial at its true rate."""
+    for trial, subject in [(9, 1), (9, 4), (16, 5), (16, 24)]:
+        tr = loader.load_trial("jog", trial, subject)
+        a_vert = orientation.vertical_component(tr.user_accel, tr.gravity)
+        chk = steps.check_sample_rate(a_vert, tr.fs_hz)
+        assert chk["sample_rate_plausible"] is True, (
+            f"jog_{trial}/sub_{subject}: ratio {chk['out_of_band_ratio']:.3f}"
+        )
+
+
+def test_understated_rate_is_a_documented_blind_spot():
+    """Halving the rate is genuinely undetectable, and the code says so.
+
+    2.7 Hz becomes 1.36 Hz, still inside the plausible human band and
+    indistinguishable from a slow walker. Pinned so the limitation stays
+    visible rather than being mistaken for coverage.
+    """
+    tr = loader.load_trial("jog", 9, 1)
+    a_vert = orientation.vertical_component(tr.user_accel, tr.gravity)
+    assert steps.check_sample_rate(a_vert, 25.0)["sample_rate_plausible"] is True
 
 
 # --- the Nyquist guard ----------------------------------------------------

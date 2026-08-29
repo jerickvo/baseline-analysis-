@@ -37,6 +37,13 @@ def robust_sigma(x: np.ndarray) -> float:
     Used instead of `np.std` for amplitude thresholds because a handful of
     hard footstrike impacts would otherwise inflate the scale that those
     same impacts are being compared against.
+
+    Returns exactly 0.0 for a constant input, which is the mathematically
+    correct answer and a trap for callers: a threshold built by scaling this
+    value becomes 0, i.e. maximally *permissive*, at exactly the moment the
+    signal carries no information. Callers that turn this into a detection
+    threshold must treat a zero or near-zero result as "no signal" rather
+    than as "accept everything" -- see `steps.detect_steps`.
     """
     med = np.median(x)
     mad = np.median(np.abs(x - med))
@@ -61,12 +68,31 @@ def spectral_peak(
     Interpolating the log-PSD across the peak bin recovers frequency to well
     below the bin spacing, which matters because a 0.0625 Hz bin error is a
     ~4 spm cadence error.
+
+    Raises on non-finite input. `np.argmax` over an all-NaN array returns
+    index 0, so without this guard an all-NaN signal would come back as a
+    confident estimate sitting at the bottom edge of the search band. There
+    is no defensible frequency for a signal that has no finite samples, so
+    this refuses rather than inventing one.
     """
+    x = np.asarray(x, dtype=float)
+    if x.size and not np.all(np.isfinite(x)):
+        n_bad = int((~np.isfinite(x)).sum())
+        raise ValueError(
+            f"spectral_peak: input has {n_bad} non-finite sample(s) of {x.size}; "
+            f"no dominant frequency is defined. Clean or reject the segment first."
+        )
     f, p = welch_psd(x, fs_hz, seconds)
     m = (f >= band[0]) & (f <= band[1])
     if not m.any():
         raise ValueError(f"search band {band} outside the spectrum (fs={fs_hz})")
     fb, pb = f[m], p[m]
+    # Defence in depth: the guard above makes this unreachable for finite
+    # input, but it protects the argmax regardless of how `p` was produced.
+    if not np.any(np.isfinite(pb)):
+        raise ValueError(
+            f"spectral_peak: power spectrum is entirely non-finite in {band} Hz"
+        )
     i = int(np.argmax(pb))
     f_peak = float(fb[i])
     if 0 < i < len(fb) - 1:
