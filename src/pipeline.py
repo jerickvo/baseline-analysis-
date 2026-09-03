@@ -149,6 +149,16 @@ def run_stages(
 # -- which drops 25-50% -- is flagged, because a summary built from half a
 # run is not a summary of the run.
 MAX_DISCARDED_STEADY_FRACTION = 0.20
+# Dropped samples (below the gap threshold) as a fraction of all samples,
+# above which the record is refused rather than caveated. Each dropped
+# sample shifts everything after it by one period on the uniform grid the
+# filters assume, so the error accumulates: at 0.1% of a 30-minute 100 Hz
+# run that is 180 samples, 1.8 s of drift by the end, 0.1% of cadence --
+# harmless for a rate, but the point where phase-sensitive quantities
+# (stage 4, any future contact timing) can no longer be trusted. A single
+# dropped sample in 180,000 must not condemn a run; a sample every few
+# seconds must.
+MAX_DROPPED_SAMPLE_FRACTION = 1e-3
 
 
 def assess_quality(result: dict) -> dict:
@@ -161,11 +171,13 @@ def assess_quality(result: dict) -> dict:
     support one.
 
     "insufficient": do not report mechanics. The record is broken (gaps,
-      dropped samples, unfinished session, non-finite data), too short,
-      recorded at an implausible rate, or shows no gait periodicity.
+      dropped samples beyond the drift budget, reordered samples, an
+      unfinished session, non-finite data), too short, recorded at an
+      implausible rate, or shows no gait periodicity.
     "partial": report with the stated caveats. The run was fragmented and
-      only its longest bout was analysed, or the horizontal frame is
-      unverified so only vertical-axis quantities are trustworthy.
+      only its longest bout was analysed, the horizontal frame is
+      unverified so only vertical-axis quantities are trustworthy, or a
+      few samples were dropped (cadence unaffected, phase not).
     "ok": every check passed.
 
     Side classification is reported as information only -- it is never a
@@ -181,10 +193,37 @@ def assess_quality(result: dict) -> dict:
     blockers: list[str] = []
     caveats: list[str] = []
 
-    if not integ.get("clean", False):
+    # File-level defects are blockers whatever the source.
+    if integ.get("n_nan", 0) or integ.get("n_inf", 0):
+        blockers.append("non-finite samples in the record")
+    if integ.get("flatline_suspect", False):
+        blockers.append(f"stuck sensor: {integ.get('longest_flatline_s', 0):.2f}s flatline")
+    if integ.get("index_contiguous") is False:
+        blockers.append("row index not contiguous")
+
+    if integ.get("has_timestamp_column", False):
+        # Logger session: reason from the measured timestamp facts.
+        if integ.get("n_gaps", 0) or integ.get("discarded_for_gaps_s", 0.0) > 0:
+            blockers.append(
+                f"{integ.get('n_gaps', 0)} gap(s); "
+                f"{integ.get('discarded_for_gaps_s', 0.0):.1f}s cut at gaps"
+            )
+        if integ.get("n_nonmonotonic", 0):
+            blockers.append(f"{integ['n_nonmonotonic']} duplicated/reordered sample(s)")
+        if integ.get("metadata_in_progress", False):
+            blockers.append("session.json marked in-progress: the app did not finish the session")
+        if not integ.get("timestamps_uniform", True) and not integ.get("n_gaps", 0) and not integ.get("n_nonmonotonic", 0):
+            blockers.append("timing jitter too large for the filters")
+        dropped = int(integ.get("n_dropped_estimate", 0))
+        if dropped:
+            frac = dropped / max(tr.n_samples, 1)
+            msg = f"~{dropped} sample(s) dropped below the gap threshold ({100 * frac:.3f}% of samples)"
+            if frac > MAX_DROPPED_SAMPLE_FRACTION:
+                blockers.append(msg + ": timing drift too large")
+            else:
+                caveats.append(msg + ": cadence unaffected, phase-sensitive quantities are not")
+    elif not integ.get("clean", False):
         blockers.append(f"record not clean: {integ.get('problems', '')}")
-    if integ.get("has_timestamp_column") and not integ.get("timestamps_uniform", True):
-        blockers.append("sampling is not uniform enough for the filters")
     if result["steady_too_short"]:
         blockers.append(
             f"only {result['steady_seconds']:.1f}s of steady motion (< {steps.MIN_STEADY_SECONDS:g}s)"

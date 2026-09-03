@@ -1,25 +1,25 @@
 # baseline-analysis — running gait signal core
 
 Signal-processing core for a running gait analysis system, prototyped in plain Python
-(numpy / scipy / pandas / matplotlib) against the MotionSense dataset.
+(numpy / scipy / pandas / matplotlib) against the MotionSense dataset and against sessions
+recorded by the companion iOS logger, [`jerickvo/baseline-ios`](https://github.com/jerickvo/baseline-ios).
 
 This is a **prototyping repo**, not an app. Scripts and notebooks over CSV. No mobile code.
 
-**Read [`REPORT.md`](REPORT.md) for the findings** — which stages work, which are shaky,
-which failed, where pocket placement and 50 Hz are doing load-bearing work, and what this
-dataset fundamentally cannot answer.
+**Read [`REPORT.md`](REPORT.md) for the findings** — including what the September 2026
+audit found and fixed (§0), which stages work, which are shaky, which failed, where pocket
+placement and 50 Hz are doing load-bearing work, and what this data fundamentally cannot
+answer.
 
-## The data, and what it is for
+## What exists, and what does not
 
-[MotionSense](https://github.com/mmalekzadeh/motion-sense) `A_DeviceMotion_data`, jog
-trials only (trials 9 and 16), 24 subjects, iPhone 6s in the front trouser pocket, 50 Hz.
+Built: loader (MotionSense **and** BaselineLogger sessions), orientation resolution, step
+detection and cadence, exploratory left/right, a data-quality gate.
 
-The production target is the **lower back at 100 Hz fused / 200 Hz raw**. This dataset is
-used only to develop and stress-test algorithms that must be *placement- and rate-agnostic*.
-Anything that silently depends on the pocket or on 50 Hz is a bug, and the code is built to
-flag it: stage 2 returns a three-valued verdict rather than a number, stage 3 attributes
-every out-of-band cadence to either the algorithm or the trial, and stage 4 reports null
-models alongside every result.
+Not built, deliberately: ground contact time, asymmetry, vertical oscillation, braking
+impulse, loading rate (they need true initial contact and sample rates MotionSense lacks);
+the per-runner pace model, residuals, within-run trajectory, changepoint detection (they need
+multi-session per-runner data at known pace); any report UI.
 
 ## Setup
 
@@ -32,66 +32,67 @@ export MOTIONSENSE_ROOT=$PWD/data/motion-sense/data   # or leave unset; the load
 ## Run
 
 ```bash
-python scripts/run_all.py                 # all 48 trials -> reports/*.csv, figures, verdict summary
-python scripts/run_invariance_checks.py   # rotation + resample sweep -> reports/invariance.csv
-python -m pytest tests/                   # 10 tests, incl. orientation and rate invariance
-jupyter notebook notebooks/gait_pipeline_walkthrough.ipynb   # one subject, every stage, plots
+python scripts/run_session.py <session_folder>   # one BaselineLogger session -> quality verdict
+python scripts/run_all.py                          # all 48 MotionSense trials -> reports/*.csv + verdict summary
+python scripts/run_invariance_checks.py            # rotation + resample sweep
+python -m pytest tests/                            # 102 tests, incl. ground-truth frame recovery
+jupyter notebook notebooks/gait_pipeline_walkthrough.ipynb
 ```
+
+`run_session.py` exits 0 for `ok`, 1 for `partial`, 2 for `insufficient`, so the verdict can
+gate a script. A session folder is what the app writes: `motion.csv`, `accel_raw.csv`,
+`gps.csv`, `session.json`.
 
 ## Layout
 
 ```
 src/
-  loader.py       stage 1  dataset access, reconstructed time index, integrity reporting
+  loader.py       stage 1  MotionSense trials and BaselineLogger sessions; integrity reporting
   orientation.py  stage 2  sensor -> anatomical frame, and the checks that can refute it
-  steps.py        stage 3  band-pass, footstrike detection, cadence, failure attribution
+  steps.py        stage 3  running-state, band-pass, step detection, cadence, attribution
   lateral.py      stage 4  exploratory left/right, with its null models
-  dsp.py                   shared primitives (spectra, filters, autocorrelation, rotations)
-  pipeline.py              end-to-end glue for one trial
+  dsp.py                   shared primitives
+  pipeline.py              run_trial / run_session / run_stages, and assess_quality
   plotting.py              figures for every stage
 scripts/
-  fetch_data.py            fetch and unpack the dataset
-  run_all.py               batch over all jog trials, write report tables and figures
+  fetch_data.py            fetch and unpack MotionSense
+  run_session.py           the pipeline on one app session
+  run_all.py               batch over MotionSense, write report tables and figures
   run_invariance_checks.py orientation and sample-rate invariance across all 48 trials
 notebooks/
   gait_pipeline_walkthrough.ipynb   one subject end to end, plots at every stage
 tests/
-  test_invariance.py       the tests behind the "placement- and rate-agnostic" claim
+  test_invariance.py       rotation and rate invariance on real data
+  test_failure_modes.py    degenerate, short and lying input
+  test_integration.py      the app's format through the pipeline, against ground truth
 reports/                   generated CSVs and figures
 REPORT.md                  findings
 ```
 
 ## Design rules the code holds itself to
 
-- **Sample rate is a parameter everywhere.** The number 50 appears once in the package
-  (`loader.DEFAULT_FS_HZ`) and only as a default argument. Verified by resampling all 48
-  trials to 25 / 100 / 200 Hz: cadence moves by a median of 0.03–0.05%, worst case 0.79%.
-- **Filter cutoffs are multiples of the estimated step frequency**, never fixed Hz, so the
-  filter is identical in relative terms at any cadence and any rate.
-- **Every cutoff, threshold and window length has a comment saying why that value.** Where
-  a value came from a sweep, the comment says what was swept and what the alternatives cost.
-- **Orientation invariance is tested, not asserted.** Rotating every sensor vector by an
-  arbitrary rotation changes cadence by exactly 0.00 spm across 144 rotated runs.
-- **A failing stage fails loudly.** Stage 2 will return `vertical_only` or `failed` and name
-  its reasons; stage 3 attributes flagged cadences to the algorithm or the trial; stage 4
-  carries `ground_truth_available: False` in every record.
+- **Sample rate is a parameter everywhere.** For logger sessions it is *measured* from the
+  timestamps. The number 50 appears once in the package, as a default for MotionSense.
+- **Filter cutoffs are multiples of the estimated step frequency**, never fixed Hz.
+- **Every cutoff, threshold and window length has a comment saying why that value.**
+- **Orientation invariance is tested, not asserted**: 0.00 spm change across 144 rotated runs,
+  and true axes recovered to < 3° from arbitrary, upside-down and yawed synthetic placements.
+- **A failing stage fails loudly, and the run gets one verdict.** Stage 2 returns
+  `ok` / `vertical_only` / `failed`; stage 3 attributes a flagged cadence to
+  `sample_rate` / `algorithm` / `trial`; `assess_quality` rolls everything into
+  `ok` / `partial` / `insufficient` with the reasons. Side classification is never a gate.
+- **Data loss is reported, never silent.** Steady motion outside the analysed bout, samples
+  dropped below the gap threshold, seconds cut at gaps, stale GPS fixes — all columns.
 
-## Headline results
+## Headline results (MotionSense, 48 trials)
 
 | | |
 |---|---|
-| Trials analysed | 48 (24 subjects × 2 jog trials), all files clean |
-| Cadence | 148.5–183.7 spm; **47/48** inside 150–190 spm |
-| Detector vs independent spectral estimate | agrees within 4% on every trial |
-| Flagged trials | 1 (`jog_9/sub_4`, 148.5 spm) — attributed to the **trial**, not the algorithm |
+| Cadence | 148.5–181.2 spm; **47/48** inside 150–190 spm |
+| Detector vs independent spectral estimate | within 5.9 % on every trial |
+| Flagged | 1 (`jog_9/sub_4`, 148.5 spm) — attributed to the **trial** |
 | Stage-2 verdicts | 2 `ok`, 46 `vertical_only`, 0 `failed` |
-| Static trial-constant frame valid | **0/48** — the pocket sensor tilts 15° median, 30° p95 within a trial |
-| Mediolateral cross-check | passes **2/48** — the ML axis is unverified at this placement |
-| Left/right alternation at detected contact | median 0.485, *below* its own surrogate null (0.561) |
-| Orientation invariance | exact: 0.00 spm cadence change, 144/144 runs |
-
-## Not built, deliberately
-
-No iOS or Swift code. No vertical oscillation, braking impulse, or loading rate — they need
-sample rates this dataset does not have. No pace normalisation or changepoint detection —
-they need multi-session per-runner data this dataset does not contain.
+| Quality roll-up | 1 `ok`, 47 `partial` (horizontal frame unverified at the pocket) |
+| Forward sign confident (two criteria must agree) | **18/48** |
+| Static trial-constant frame valid | **0/48** |
+| Orientation invariance | exact: 0.00 spm, 144/144 |

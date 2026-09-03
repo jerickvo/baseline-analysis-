@@ -467,3 +467,41 @@ def test_leading_and_trailing_transients_are_never_bridged():
     seg = steps.steady_state_segment(mag, 100.0)
     assert seg["trimmed_start_s"] >= 1.0 - 1e-9
     assert seg["trimmed_end_s"] >= 1.0 - 1e-9
+
+
+# --- dropped samples: proportional, not binary ------------------------------
+
+
+def _drop_rows(folder: Path, indices) -> None:
+    lines = (folder / "motion.csv").read_text().splitlines()
+    for i in sorted(indices, reverse=True):
+        del lines[i]
+    (folder / "motion.csv").write_text("\n".join(lines) + "\n")
+    meta = json.loads((folder / "session.json").read_text())
+    meta["motionSampleCount"] -= len(list(indices))
+    (folder / "session.json").write_text(json.dumps(meta))
+
+
+def test_a_few_dropped_samples_are_a_caveat_not_a_refusal(tmp_path):
+    """Two drops in 9000 samples (0.02%) must not condemn the run."""
+    anat = synthetic_anatomical()
+    folder = write_logger_session(tmp_path / "fewdrops", anat, np.eye(3), jitter_s=0.0)
+    _drop_rows(folder, [3000, 6000])
+    result = pipeline.run_session(folder)
+    q = result["quality"]
+    assert result["trial"].integrity["n_dropped_estimate"] == 2
+    assert q["verdict"] == "partial", q["summary"]
+    assert any("dropped" in c for c in q["caveats"])
+    assert not any("dropped" in b for b in q["blockers"])
+
+
+def test_many_dropped_samples_are_a_refusal(tmp_path):
+    """Twenty drops in 9000 (0.22%) exceeds the 0.1% drift budget."""
+    anat = synthetic_anatomical()
+    folder = write_logger_session(tmp_path / "manydrops", anat, np.eye(3), jitter_s=0.0)
+    _drop_rows(folder, list(range(400, 8400, 400)))
+    result = pipeline.run_session(folder)
+    q = result["quality"]
+    assert result["trial"].integrity["n_dropped_estimate"] == 20
+    assert q["verdict"] == "insufficient"
+    assert any("dropped" in b for b in q["blockers"])

@@ -298,9 +298,9 @@ def resolve_forward_sign(
         ill-conditioned by construction.
 
     Measured on the pocket dataset the two criteria have equal effect size
-    (median |stat| 0.20 each) and equal split-half consistency, yet
-    **disagree on the sign in 19 of 48 trials**. Requiring both to agree
-    drops the confident count from 35/48 to 17/48, which is the honest
+    (median |stat| 0.20 and 0.19) and equal split-half consistency, yet
+    **disagree on the sign in 18 of 48 trials**. Requiring both to agree
+    drops the confident count from 35/48 to 18/48, which is the honest
     number. Internal consistency was never evidence of correctness --
     that is why agreement between two independent criteria is now the
     confidence test. Nothing in stages 3 or 4 depends on the result: it

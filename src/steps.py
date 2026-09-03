@@ -67,14 +67,16 @@ MIN_BREAK_SECONDS = 3.0
 # offset left by imperfect gravity removal.
 HIGHPASS_STEP_FREQ_MULTIPLE = 0.7
 # Low-pass at 1.5 x f_step: keeps the fundamental, excludes the second
-# harmonic. Measured on this dataset the second harmonic carries up to 21%
-# of fundamental power, and passing it puts a genuine *second* crest inside
-# every step cycle -- ensemble-averaging the step cycle shows 2.0 peaks per
-# cycle at a 3 x f_step cutoff versus 1.0 at 1.5 x. Sweeping the cutoff
-# against an independent spectral cadence estimate, 1.5 x gave 1.1% median
-# error and was the only setting insensitive to the peak-spacing
-# constraint, i.e. it rejects the harmonic on filter shape alone rather
-# than leaning on the minimum-distance rule to hide it.
+# harmonic. Measured on this dataset the second harmonic carries 11.6% of
+# fundamental power at the median and up to 67%, and passing it puts a
+# genuine *second* crest inside every step cycle -- ensemble-averaging the
+# step cycle shows 2.0 peaks per cycle at a 3 x f_step cutoff versus 1.0 at
+# 1.5 x. Sweeping the cutoff against an independent spectral cadence
+# estimate, 1.5 x gave 0.58% median error and was the only setting
+# insensitive to the peak-spacing constraint (x1.0 with the rule disabled,
+# vs x2.4 at 2.0 x and x30 at 3.0 x), i.e. it rejects the harmonic on
+# filter shape alone rather than leaning on the minimum-distance rule to
+# hide it.
 LOWPASS_STEP_FREQ_MULTIPLE = 1.5
 # Never let the low cutoff approach Nyquist. 0.4 x fs leaves the Butterworth
 # transition band comfortably inside the spectrum; matters at low rates or
@@ -124,7 +126,7 @@ MIN_STRIDE_REGULARITY = 0.30
 # gait fundamental is not where `fs_hz` says it is, and the rate is the
 # prime suspect. Measured on this dataset: across all 48 trials at the
 # correct rate the out-of-band / in-band peak-power ratio never exceeds
-# 0.435 (the second harmonic is always weaker than the fundamental), while
+# 0.44 (the second harmonic is always weaker than the fundamental), while
 # claiming 100 Hz for 50 Hz data gives 15.1 and claiming 200 Hz gives 1002.
 # 1.0 sits in that empty gap and is also the natural physical boundary:
 # more power outside the human band than inside it.
@@ -473,8 +475,8 @@ def cadence_summary(
     # of the band-passed fundamental shifts by a different amount on
     # alternate steps, so the detected timestamps alternate short-long even
     # if the runner's true step times do not. On this dataset this quantity
-    # correlates at r = -0.91 with the amplitude-domain step symmetry index,
-    # which is what that artifact looks like. Values here reach 32%, far
+    # correlates at r = -0.77 with the amplitude-domain step symmetry index,
+    # which is what that artifact looks like. Values here reach 34%, far
     # beyond the 1-3% real runners show.
     even, odd = intervals[0::2], intervals[1::2]
     n = min(len(even), len(odd))
