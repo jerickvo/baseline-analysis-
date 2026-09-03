@@ -44,6 +44,14 @@ STEADY_RMS_FRACTION = 0.5
 # Trials shorter than this after trimming are not worth reporting a cadence
 # for: 5 s is ~14 steps, the minimum for a stable interval statistic.
 MIN_STEADY_SECONDS = 5.0
+# A dip below the RMS threshold shorter than this is bridged, not treated
+# as a break between bouts. Measured on MotionSense, 14 of 48 continuous
+# jog trials contained a single sub-threshold second -- a turn, a soft
+# step -- and a one-window break rule cut each of them to roughly half its
+# length without a word. 3 s is longer than any single-step anomaly
+# (~0.35 s) or a turn (1-2 s) and far shorter than any real stop, which
+# lasts tens of seconds.
+MIN_BREAK_SECONDS = 3.0
 
 # --- detection band ------------------------------------------------------
 
@@ -152,19 +160,38 @@ def steady_state_segment(
     rms = np.sqrt((x[: k * w].reshape(k, w) ** 2).mean(axis=1))
     active = rms >= rms_fraction * np.median(rms)
 
-    best_start = best_len = 0
+    # Bridge inactive runs shorter than MIN_BREAK_SECONDS: they are dips
+    # inside a bout, not breaks between bouts. Leading and trailing
+    # inactive runs are never bridged -- those are the handling transients
+    # this function exists to remove.
+    min_break_windows = int(np.ceil(MIN_BREAK_SECONDS / window_s))
+    i = 0
+    while i < k:
+        if not active[i]:
+            j = i
+            while j < k and not active[j]:
+                j += 1
+            if i > 0 and j < k and (j - i) < min_break_windows:
+                active[i:j] = True
+            i = j
+        else:
+            i += 1
+
+    # Every contiguous run of active windows, as (start_sample, stop_sample).
+    # The longest is returned as the segment to analyse -- unchanged
+    # behaviour -- but the others are no longer thrown away in silence.
+    segments: list[tuple[int, int]] = []
     i = 0
     while i < k:
         if active[i]:
             j = i
             while j < k and active[j]:
                 j += 1
-            if j - i > best_len:
-                best_start, best_len = i, j - i
+            segments.append((i * w, min(n, j * w)))
             i = j
         else:
             i += 1
-    if best_len == 0:
+    if not segments:
         return {
             "start": 0,
             "stop": n,
@@ -173,9 +200,19 @@ def steady_state_segment(
             "trimmed_start_s": 0.0,
             "trimmed_end_s": 0.0,
             "kept_fraction": 1.0,
+            "segments": [],
+            "n_segments": 0,
+            "discarded_steady_s": 0.0,
         }
-    start = best_start * w
-    stop = min(n, (best_start + best_len) * w)
+    start, stop = max(segments, key=lambda s: s[1] - s[0])
+    # Steady motion in the *other* segments. The product targets 20-60 min
+    # runs; a single traffic-light stop splits one into two bouts, and
+    # keeping only the longer bout can drop half the run. That loss is now
+    # measured and reported so a caller can refuse to summarise a run from
+    # a fraction of it. Handling multiple bouts is a pipeline design
+    # decision (per-bout vs pooled step lists) and is deliberately not made
+    # here.
+    discarded = sum(b - a for a, b in segments) - (stop - start)
     return {
         "start": int(start),
         "stop": int(stop),
@@ -185,6 +222,9 @@ def steady_state_segment(
         "trimmed_end_s": float((n - stop) / fs_hz),
         "kept_fraction": float((stop - start) / n),
         "window_rms": rms,
+        "segments": [(int(a), int(b)) for a, b in segments],
+        "n_segments": int(len(segments)),
+        "discarded_steady_s": float(discarded / fs_hz),
     }
 
 

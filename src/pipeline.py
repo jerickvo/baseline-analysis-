@@ -22,15 +22,45 @@ def run_trial(
     trim_to_steady_state: bool = True,
     seed: int = 0,
 ) -> dict:
-    """Run every stage on one trial.
-
-    Returns a dict with the loaded `Trial`, the stage-2 frame and its
-    verification, stage-3 detections and cadence, and the stage-4
-    exploratory analysis. Nothing is suppressed on failure: if stage 2
-    reports `verdict == "failed"` the later stages still run, and the
-    verdict travels with the result so a caller can refuse to use it.
-    """
+    """Run every stage on one MotionSense trial. See `run_stages`."""
     tr = loader.load_trial(activity, trial, subject, root, fs_hz)
+    return run_stages(tr, frame_mode, forward_method, trim_to_steady_state, seed)
+
+
+def run_session(
+    folder,
+    on_gap: str = "raise",
+    frame_mode: str = "tracking",
+    forward_method: str = "step_band",
+    trim_to_steady_state: bool = True,
+    seed: int = 0,
+) -> dict:
+    """Run every stage on one BaselineLogger session folder.
+
+    The sample rate is measured from the session's own timestamps, so the
+    same stages run at whatever rate the phone delivered. See
+    `loader.load_logger_session` for `on_gap`.
+    """
+    tr = loader.load_logger_session(folder, on_gap=on_gap)
+    return run_stages(tr, frame_mode, forward_method, trim_to_steady_state, seed)
+
+
+def run_stages(
+    tr: loader.Trial,
+    frame_mode: str = "tracking",
+    forward_method: str = "step_band",
+    trim_to_steady_state: bool = True,
+    seed: int = 0,
+) -> dict:
+    """Stages 2-4 on an already-loaded `Trial`, plus the quality roll-up.
+
+    Returns a dict with the `Trial`, the stage-2 frame and its
+    verification, stage-3 detections and cadence, the stage-4 exploratory
+    analysis, and a single `quality` verdict. Nothing is suppressed on
+    failure: if stage 2 reports `verdict == "failed"` the later stages
+    still run, and the verdict travels with the result so a caller can
+    refuse to use it.
+    """
     fs = tr.fs_hz
 
     # --- stage 3a: trim handling transients. Done on rotation-invariant
@@ -92,7 +122,7 @@ def run_trial(
     # --- stage 4: exploratory L/R
     lat = lateral.analyse(gyro, gravity, det["step_indices"], fs, f_step, mode=frame_mode, seed=seed)
 
-    return {
+    result = {
         "trial": tr,
         "segment": seg,
         "steady_seconds": steady_s,
@@ -108,6 +138,90 @@ def run_trial(
         "cadence_diagnosis": diag,
         "sample_rate_check": rate_check,
         "lateral": lat,
+    }
+    result["quality"] = assess_quality(result)
+    return result
+
+
+# Fraction of steady running that may sit outside the analysed bout before
+# the run is called fragmented. 0.2 allows a short warm-up or cool-down
+# bout to be dropped without comment, while a run split by a mid-run stop
+# -- which drops 25-50% -- is flagged, because a summary built from half a
+# run is not a summary of the run.
+MAX_DISCARDED_STEADY_FRACTION = 0.20
+
+
+def assess_quality(result: dict) -> dict:
+    """One verdict for the run: "ok", "partial" or "insufficient".
+
+    This is the gate between the numbers and anyone reading them. Every
+    stage already reports its own diagnostics; this collects the ones that
+    decide whether the run should be summarised at all, so that a
+    beautiful report cannot be produced from a record that does not
+    support one.
+
+    "insufficient": do not report mechanics. The record is broken (gaps,
+      dropped samples, unfinished session, non-finite data), too short,
+      recorded at an implausible rate, or shows no gait periodicity.
+    "partial": report with the stated caveats. The run was fragmented and
+      only its longest bout was analysed, or the horizontal frame is
+      unverified so only vertical-axis quantities are trustworthy.
+    "ok": every check passed.
+
+    Side classification is reported as information only -- it is never a
+    gate, because nothing downstream is allowed to depend on it yet.
+    """
+    tr = result["trial"]
+    integ = tr.integrity
+    v = result["verify"]
+    cd = result["cadence_diagnosis"]
+    seg = result["segment"]
+    lat = result["lateral"]
+
+    blockers: list[str] = []
+    caveats: list[str] = []
+
+    if not integ.get("clean", False):
+        blockers.append(f"record not clean: {integ.get('problems', '')}")
+    if integ.get("has_timestamp_column") and not integ.get("timestamps_uniform", True):
+        blockers.append("sampling is not uniform enough for the filters")
+    if result["steady_too_short"]:
+        blockers.append(
+            f"only {result['steady_seconds']:.1f}s of steady motion (< {steps.MIN_STEADY_SECONDS:g}s)"
+        )
+    if not cd["sample_rate_plausible"]:
+        blockers.append("sample rate is probably wrong (see cadence diagnosis)")
+    if v["verdict"] == "failed":
+        blockers.append("vertical acceleration shows no repeating gait structure")
+    if cd["failure_attributed_to"] == "algorithm":
+        blockers.append(f"step detector failed: {cd['diagnosis']}")
+
+    kept = result["steady_seconds"]
+    discarded = float(seg.get("discarded_steady_s", 0.0))
+    total_steady = kept + discarded
+    if total_steady > 0 and discarded / total_steady > MAX_DISCARDED_STEADY_FRACTION:
+        caveats.append(
+            f"fragmented run: {seg.get('n_segments', 1)} bouts, only the longest "
+            f"({kept:.0f}s) analysed, {discarded:.0f}s of steady motion left out"
+        )
+    if v["verdict"] == "vertical_only":
+        caveats.append("horizontal frame unverified: forward/mediolateral quantities are not trustworthy")
+    if cd["failure_attributed_to"] == "trial" and not result["steady_too_short"]:
+        caveats.append(f"cadence outside the expected band: {cd['diagnosis']}")
+
+    side = (
+        "unreliable"
+        if not (lat["alternation_consistent"] and lat["excess_over_surrogate"] > 0.10)
+        else "consistent (not validated: no ground truth)"
+    )
+
+    verdict = "insufficient" if blockers else ("partial" if caveats else "ok")
+    return {
+        "verdict": verdict,
+        "blockers": blockers,
+        "caveats": caveats,
+        "side_classification": side,
+        "summary": "; ".join(blockers + caveats) if (blockers or caveats) else "all checks passed",
     }
 
 
@@ -134,6 +248,8 @@ def flatten(result: dict) -> dict:
         "trimmed_start_s": result["segment"]["trimmed_start_s"],
         "trimmed_end_s": result["segment"]["trimmed_end_s"],
         "steady_s": result["steady_seconds"],
+        "n_steady_segments": result["segment"].get("n_segments", 1),
+        "discarded_steady_s": result["segment"].get("discarded_steady_s", 0.0),
         # stage 2
         "frame_mode": fr.mode,
         "frame_verdict": v["verdict"],
@@ -141,6 +257,9 @@ def flatten(result: dict) -> dict:
         "forward_eig_ratio": fr.diagnostics["forward_eigenvalue_ratio"],
         "forward_well_conditioned": fr.diagnostics["forward_well_conditioned"],
         "forward_sign_confident": fr.diagnostics["forward_sign_confident"],
+        "forward_sign_criteria_agree": fr.diagnostics["forward_sign_criteria_agree"],
+        "forward_phase_effect_size": fr.diagnostics["forward_phase_effect_size"],
+        "forward_impact_effect_size": fr.diagnostics["forward_impact_effect_size"],
         "vertical_tilt_median_deg": stab["vertical_tilt_median_deg"],
         "vertical_tilt_p95_deg": stab["vertical_tilt_p95_deg"],
         "forward_drift_p95_deg": stab["forward_drift_p95_deg"],
@@ -187,4 +306,8 @@ def flatten(result: dict) -> dict:
         "omega_stride_over_step_power": lat["stride_over_step_power"],
         "cluster_separation_d": lat["cluster_separation_d"],
         "ground_truth_available": lat["ground_truth_available"],
+        # roll-up
+        "quality_verdict": result["quality"]["verdict"],
+        "quality_summary": result["quality"]["summary"],
+        "side_classification": result["quality"]["side_classification"],
     }

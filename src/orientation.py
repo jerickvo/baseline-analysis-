@@ -277,17 +277,35 @@ def resolve_forward_sign(
 ) -> dict:
     """Fix the 180-degree ambiguity of the forward axis.
 
-    Criterion (biomechanical, placement-agnostic in principle): at the
-    vertical-acceleration peak the body is in early stance, where the
-    ground reaction force decelerates the runner. Fore-aft acceleration is
-    therefore *negative* (braking) at that instant. Pick the sign that makes
-    it so.
+    Two criteria are evaluated and the sign is called confident only when
+    they agree. Both rest on the same biomechanics of a stance phase: the
+    ground reaction force brakes the runner early in stance and propels
+    them late in stance, while vertical acceleration rises through early
+    stance and falls through late stance.
 
-    Honesty note: this is the weakest inference in stage 2. It is reported
-    with an effect size and a split-half consistency flag, and **nothing in
-    stages 3 or 4 depends on it** -- it sets the polarity of the forward
-    trace on plots and the left/right naming of the mediolateral axis, not
-    any number we compute.
+    ``phase`` (primary)
+        Braking coincides with *rising* vertical acceleration, propulsion
+        with *falling*, so fore-aft acceleration is anti-correlated with the
+        time derivative of vertical acceleration: pick the sign that makes
+        corr(a_fwd, d a_vert/dt) negative. This holds at the centre of mass
+        -- the lower back, where the product will run -- because there the
+        vertical peak is midstance, the moment fore-aft force crosses zero.
+
+    ``impact`` (cross-check, the original criterion)
+        Fore-aft acceleration should be negative *at* the vertical peak.
+        Valid where the peak is early stance (a thigh-worn sensor), but at
+        the centre of mass it samples the zero crossing and is
+        ill-conditioned by construction.
+
+    Measured on the pocket dataset the two criteria have equal effect size
+    (median |stat| 0.20 each) and equal split-half consistency, yet
+    **disagree on the sign in 19 of 48 trials**. Requiring both to agree
+    drops the confident count from 35/48 to 17/48, which is the honest
+    number. Internal consistency was never evidence of correctness --
+    that is why agreement between two independent criteria is now the
+    confidence test. Nothing in stages 3 or 4 depends on the result: it
+    sets plot polarity and the left/right naming of the mediolateral axis,
+    not any number computed.
     """
     a = np.asarray(user_accel, float)
     up = np.asarray(up, float) / np.linalg.norm(up)
@@ -298,36 +316,52 @@ def resolve_forward_sign(
     lo, hi = 0.5 * f_step_hz, min(2.0 * f_step_hz, 0.4 * fs_hz)
     a_vert = dsp.bandpass(a @ up, fs_hz, lo, hi)
     a_fwd = dsp.bandpass(a @ axis, fs_hz, lo, hi)
+    d_vert = np.gradient(a_vert) * fs_hz
 
-    # "Early stance" = samples in the top quartile of vertical acceleration.
-    # A quartile (rather than the peak sample) averages over ~1/4 of each
-    # step, which at 50 Hz is ~4 samples -- enough to be stable.
-    thr = np.quantile(a_vert, 0.75)
-    sel = a_vert >= thr
-    mean_fwd_at_impact = float(a_fwd[sel].mean())
-    scale = dsp.robust_sigma(a_fwd) or 1.0
-    effect = mean_fwd_at_impact / scale
+    def _phase_stat(av_d: np.ndarray, af: np.ndarray) -> float:
+        if len(af) < 4 or np.std(af) == 0 or np.std(av_d) == 0:
+            return 0.0
+        return float(np.corrcoef(af, av_d)[0, 1])
 
-    # Split-half consistency: does the first half of the trial vote the same
-    # way as the second? If not, the criterion is not resolving anything.
-    half = len(a_vert) // 2
-    votes = []
-    for s in (slice(0, half), slice(half, None)):
-        av, af = a_vert[s], a_fwd[s]
+    def _impact_stat(av: np.ndarray, af: np.ndarray) -> float:
+        # Top quartile of vertical acceleration: ~1/4 of each step, which at
+        # 50 Hz is ~4 samples -- enough to be stable.
         if len(av) < 4:
-            continue
-        votes.append(np.sign(af[av >= np.quantile(av, 0.75)].mean()))
-    consistent = bool(len(votes) == 2 and votes[0] == votes[1] and votes[0] != 0)
+            return 0.0
+        scale = dsp.robust_sigma(af) or 1.0
+        return float(af[av >= np.quantile(av, 0.75)].mean() / scale)
 
-    flip = mean_fwd_at_impact > 0  # want braking (negative) at impact
+    phase = _phase_stat(d_vert, a_fwd)
+    impact = _impact_stat(a_vert, a_fwd)
+
+    # Split-half consistency of each criterion on its own.
+    half = len(a_vert) // 2
+    halves = (slice(0, half), slice(half, None))
+    phase_votes = [np.sign(_phase_stat(d_vert[s], a_fwd[s])) for s in halves]
+    impact_votes = [np.sign(_impact_stat(a_vert[s], a_fwd[s])) for s in halves]
+    phase_consistent = bool(phase_votes[0] == phase_votes[1] != 0)
+    impact_consistent = bool(impact_votes[0] == impact_votes[1] != 0)
+
+    # Both criteria want a NEGATIVE statistic for a correctly oriented axis;
+    # the primary (phase) criterion decides the flip.
+    flip = phase > 0
+    criteria_agree = bool(np.sign(phase) == np.sign(impact) != 0)
+
+    # |stat| < 0.1: the signature is under a tenth of the signal's own scale
+    # (impact) or a correlation too weak to trust (phase): a coin flip.
+    strong = abs(phase) >= 0.1 and abs(impact) >= 0.1
     return {
         "flip": bool(flip),
         "axis": -axis if flip else axis,
-        "braking_effect_size": float(effect),
-        "split_half_consistent": consistent,
-        # |effect| < 0.1 means the braking signature is under a tenth of the
-        # fore-aft signal's own scale: the sign is essentially a coin flip.
-        "sign_confident": bool(abs(effect) >= 0.1 and consistent),
+        "phase_effect_size": float(phase),
+        "impact_effect_size": float(impact),
+        "braking_effect_size": float(phase),  # kept for existing consumers
+        "split_half_consistent": phase_consistent,
+        "impact_split_half_consistent": impact_consistent,
+        "criteria_agree": criteria_agree,
+        "sign_confident": bool(
+            strong and criteria_agree and phase_consistent and impact_consistent
+        ),
     }
 
 
@@ -381,6 +415,9 @@ def build_frame(
         "f_step_hz_used": fwd_est["f_step_hz"],
         "forward_sign_flipped": sign["flip"],
         "forward_braking_effect_size": sign["braking_effect_size"],
+        "forward_phase_effect_size": sign["phase_effect_size"],
+        "forward_impact_effect_size": sign["impact_effect_size"],
+        "forward_sign_criteria_agree": sign["criteria_agree"],
         "forward_sign_confident": sign["sign_confident"],
         "forward_sign_split_half_consistent": sign["split_half_consistent"],
         "orthonormal_residual": float(np.abs(R @ R.T - np.eye(3)).max()),

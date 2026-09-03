@@ -125,6 +125,11 @@ def print_verdicts(t: pd.DataFrame) -> None:
     print(f"  step symmetry index              median {t['step_symmetry_index'].median():.2f} "
           f"(range {t['step_symmetry_index'].min():.2f}-{t['step_symmetry_index'].max():.2f})")
 
+    print(f"  forward sign: criteria agree     {int(t['forward_sign_criteria_agree'].sum())}/{n}, "
+          f"confident {int(t['forward_sign_confident'].sum())}/{n}")
+    print(f"  steady motion outside bout       max {t['discarded_steady_s'].max():.0f} s, "
+          f"{int((t['n_steady_segments'] > 1).sum())}/{n} trials have >1 bout")
+
     print("\n[stage 3] steps and cadence")
     print(f"  cadence                          {t['cadence_spm'].min():.1f}-{t['cadence_spm'].max():.1f} spm "
           f"(median {t['cadence_spm'].median():.1f})")
@@ -136,6 +141,12 @@ def print_verdicts(t: pd.DataFrame) -> None:
     for _, r in flagged.iterrows():
         print(f"    {r['activity']}_{r['trial']}/sub_{r['subject']}: {r['cadence_spm']:.1f} spm "
               f"-> cause={r['cadence_failure_cause']}: {r['cadence_diagnosis']}")
+
+    print("\n[quality roll-up]")
+    for verdict, cnt in t["quality_verdict"].value_counts().items():
+        print(f"  {verdict:<14s}                   {cnt}/{n}")
+    for side, cnt in t["side_classification"].value_counts().items():
+        print(f"  side: {side[:40]:<40s} {cnt}/{n}")
 
     print("\n[stage 4] left/right (EXPLORATORY -- no ground truth in this dataset)")
     print(f"  alternation at detected contact  median {t['alternation_consistency'].median():.3f}")

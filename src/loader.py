@@ -67,17 +67,28 @@ FLATLINE_SECONDS = 0.1
 
 @dataclass(frozen=True)
 class TrialID:
-    """Addresses one CSV: one subject performing one trial of one activity."""
+    """Addresses one recording.
+
+    MotionSense trials are (activity, trial, subject). A BaselineLogger
+    session carries its folder name in `session_id` instead; the three
+    MotionSense fields are then placeholders so every consumer sees one
+    type.
+    """
 
     activity: str
     trial: int
     subject: int
+    session_id: str | None = None
 
-    def __str__(self) -> str:  # e.g. "jog_9/sub_3"
+    def __str__(self) -> str:  # e.g. "jog_9/sub_3" or "20260828T134502Z"
+        if self.session_id is not None:
+            return self.session_id
         return f"{self.activity}_{self.trial}/sub_{self.subject}"
 
     @property
     def label(self) -> str:
+        if self.session_id is not None:
+            return self.activity  # the session label typed on the phone
         return f"{self.activity}_{self.trial}"
 
 
@@ -90,6 +101,10 @@ class Trial:
     df: pd.DataFrame
     path: Path
     integrity: dict = field(default_factory=dict)
+    # Present only for BaselineLogger sessions: cleaned GPS fixes and the
+    # session.json contents. MotionSense has neither.
+    gps: pd.DataFrame | None = None
+    metadata: dict | None = None
 
     # -- convenience views. Each returns an (n, 3) float array in the
     #    *sensor* frame; stage 2 is what rotates them into anatomy.
@@ -385,3 +400,291 @@ def summarize_trials(
         rows.append(row)
     out = pd.DataFrame(rows)
     return out.sort_values(["trial", "subject"]).reset_index(drop=True)
+
+
+# --- BaselineLogger sessions ----------------------------------------------
+#
+# The iOS logger (jerickvo/baseline-ios) writes one folder per session:
+#
+#     <folder>/motion.csv      t,ax,ay,az,gx,gy,gz,rx,ry,rz,qw,qx,qy,qz
+#     <folder>/accel_raw.csv   t,ax,ay,az            (200 Hz raw, gravity in)
+#     <folder>/gps.csv         t,latitude,longitude,speed,horizontalAccuracy,altitude
+#     <folder>/session.json    counts, achieved rates, gap statistics, markers
+#
+# Unlike MotionSense, `t` is a REAL per-sample hardware timestamp (seconds
+# since session start on the monotonic clock), so sampling irregularities
+# are measurable here and are measured. The vector columns are the same
+# CoreMotion quantities as MotionSense's, in the same device (body) frame,
+# so once the columns are renamed every later stage runs unchanged.
+
+LOGGER_MOTION_FILENAME = "motion.csv"
+LOGGER_ACCEL_FILENAME = "accel_raw.csv"
+LOGGER_GPS_FILENAME = "gps.csv"
+SESSION_JSON_FILENAME = "session.json"
+LOGGER_TIME_COLUMN = "t"
+LOGGER_MOTION_COLUMNS = [
+    "t", "ax", "ay", "az", "gx", "gy", "gz", "rx", "ry", "rz", "qw", "qx", "qy", "qz",
+]
+LOGGER_TO_DEVICE_MOTION = {
+    "ax": "userAcceleration.x", "ay": "userAcceleration.y", "az": "userAcceleration.z",
+    "gx": "gravity.x", "gy": "gravity.y", "gz": "gravity.z",
+    "rx": "rotationRate.x", "ry": "rotationRate.y", "rz": "rotationRate.z",
+}
+# A sample interval more than this multiple of the measured median interval
+# is a gap. Identical to the app's GapTracker rule, so the two agree on what
+# a gap is; the loader also recomputes it rather than trusting session.json.
+GAP_INTERVAL_MULTIPLE = 3.0
+# A gap is not the only way to lose samples. One dropped sample makes a 2x
+# interval and two make exactly 3x: the gap rule never counts either, so a
+# stream can read "no gaps" while shedding a sample every few seconds. Any
+# interval beyond 1.5x the median is therefore also converted into an
+# estimate of samples missing -- round(interval / median) - 1 -- and that
+# count is reported separately from gaps. 1.5x sits halfway between a
+# normal interval (1x, plus jitter of a few percent) and one dropped sample
+# (2x).
+DROPPED_SAMPLE_INTERVAL_MULTIPLE = 1.5
+# Jitter, as a fraction of the median interval, above which the record is
+# no longer "uniform enough" for the filters. A tenth of the sample period
+# is 1 ms at 100 Hz; the phase error a 1 ms timing wobble puts on a 3 Hz
+# fundamental is 0.02 rad, far below anything the band-pass or the peak
+# picker can resolve. Hardware timestamps from CoreMotion sit an order of
+# magnitude under this.
+UNIFORM_JITTER_FRACTION = 0.10
+
+
+def quaternion_to_euler(qw, qx, qy, qz) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Roll, pitch, yaw (radians) from a unit quaternion, ZYX convention.
+
+    Provided so a logger session carries the same 12 columns as MotionSense.
+    Nothing analytical consumes attitude -- every stage works from gravity,
+    userAcceleration and rotationRate -- and CoreMotion's own roll/pitch/yaw
+    may differ from this standard aerospace convention in axis order and
+    sign. Treat these three columns as display-only.
+    """
+    qw, qx, qy, qz = (np.asarray(v, float) for v in (qw, qx, qy, qz))
+    roll = np.arctan2(2 * (qw * qx + qy * qz), 1 - 2 * (qx * qx + qy * qy))
+    pitch = np.arcsin(np.clip(2 * (qw * qy - qz * qx), -1.0, 1.0))
+    yaw = np.arctan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz))
+    return roll, pitch, yaw
+
+
+def check_timestamps(t: np.ndarray, gap_multiple: float = GAP_INTERVAL_MULTIPLE) -> dict:
+    """Everything the timestamp column says about how the data was sampled.
+
+    This is the measurement MotionSense could never support. The median
+    interval defines the achieved rate; jitter is the robust spread around
+    it; a gap is an interval beyond `gap_multiple` times the median; and
+    non-monotonic intervals (duplicated or reordered samples) are counted
+    separately because the app's tracker does not see them at all.
+    """
+    t = np.asarray(t, float)
+    n = len(t)
+    if n < 2:
+        return {
+            "n_samples": n, "measured_fs_hz": np.nan, "median_interval_s": np.nan,
+            "jitter_ms": np.nan, "n_gaps": 0, "largest_gap_s": 0.0, "gaps": [],
+            "n_nonmonotonic": 0, "t_start_s": float(t[0]) if n else np.nan,
+            "t_end_s": float(t[-1]) if n else np.nan, "uniform": False,
+        }
+    d = np.diff(t)
+    positive = d[d > 0]
+    median = float(np.median(positive)) if positive.size else np.nan
+    fs = 1.0 / median if median and np.isfinite(median) else np.nan
+    # 1.4826 * MAD, in ms: robust to the gaps it is measured alongside.
+    jitter_ms = float(1.4826 * np.median(np.abs(positive - median)) * 1000.0) if positive.size else np.nan
+    threshold = gap_multiple * median if np.isfinite(median) else np.inf
+    gap_idx = np.flatnonzero(d > threshold)
+    gaps = [(int(i), float(t[i]), float(d[i])) for i in gap_idx]  # (index, at_s, length_s)
+    if np.isfinite(median):
+        long_ = d[d > DROPPED_SAMPLE_INTERVAL_MULTIPLE * median]
+        n_dropped = int(np.sum(np.round(long_ / median) - 1)) if long_.size else 0
+    else:
+        n_dropped = 0
+    n_nonmonotonic = int((d <= 0).sum())
+    jitter_ok = np.isfinite(jitter_ms) and (jitter_ms / 1000.0) < UNIFORM_JITTER_FRACTION * median
+    return {
+        "n_samples": int(n),
+        "measured_fs_hz": float(fs),
+        "median_interval_s": median,
+        "jitter_ms": jitter_ms,
+        "n_gaps": int(len(gaps)),
+        "largest_gap_s": float(d[gap_idx].max()) if gap_idx.size else 0.0,
+        "gaps": gaps,
+        # Samples estimated missing from sub-gap-threshold long intervals.
+        # Independent of `n_gaps`, and the number the app's own tracker
+        # cannot see.
+        "n_dropped_estimate": n_dropped,
+        "n_nonmonotonic": n_nonmonotonic,
+        "t_start_s": float(t[0]),
+        "t_end_s": float(t[-1]),
+        # "Uniform enough" for the filters: no gaps, no reordering, and
+        # jitter under UNIFORM_JITTER_FRACTION of the sample period.
+        "uniform": bool(len(gaps) == 0 and n_nonmonotonic == 0 and jitter_ok),
+    }
+
+
+def load_logger_gps(folder: str | Path) -> tuple[pd.DataFrame, dict]:
+    """gps.csv with the rows no analysis should see removed, and a count of them.
+
+    CoreLocation commonly delivers a *cached* last-known fix first, stamped
+    minutes or hours before the session started; the logger writes it as is,
+    with a large negative `t`. Speed is -1 when CoreLocation could not
+    compute it and horizontalAccuracy is negative when the fix is invalid.
+    All three are dropped here, and counted, rather than silently entering a
+    pace estimate.
+    """
+    path = Path(folder) / LOGGER_GPS_FILENAME
+    if not path.is_file():
+        return pd.DataFrame(), {"gps_rows": 0, "gps_dropped_stale": 0, "gps_dropped_invalid": 0}
+    g = pd.read_csv(path)
+    n0 = len(g)
+    stale = g["t"] < 0
+    invalid = (g["speed"] < 0) | (g["horizontalAccuracy"] < 0)
+    # Newer sessions carry speedAccuracy / verticalAccuracy (negative when
+    # the corresponding value is invalid); older files predate the columns.
+    if "speedAccuracy" in g.columns:
+        invalid |= g["speedAccuracy"] < 0
+    kept = g[~stale & ~invalid].reset_index(drop=True)
+    return kept, {
+        "gps_rows": int(n0),
+        "gps_dropped_stale": int(stale.sum()),
+        "gps_dropped_invalid": int((invalid & ~stale).sum()),
+        "gps_kept": int(len(kept)),
+    }
+
+
+def load_logger_session(
+    folder: str | Path,
+    on_gap: str = "raise",
+    gap_multiple: float = GAP_INTERVAL_MULTIPLE,
+) -> Trial:
+    """Load one BaselineLogger session folder as a `Trial`.
+
+    The sample rate is **measured from the timestamps**, never assumed, and
+    the returned `Trial.fs_hz` is that measurement. Every later stage takes
+    the rate as a parameter, so the pipeline runs at whatever rate the phone
+    actually delivered.
+
+    Because every filter downstream assumes a uniform grid, a session with a
+    gap cannot be handed on as one continuous record: the uniform index
+    would compress time across the gap and put every later timestamp in the
+    wrong place. `on_gap` decides what happens:
+
+    ``"raise"`` (default)
+        Refuse. Matches the app's own policy -- its summary screen says to
+        distrust a gapped session -- and matches how this package treats
+        every other unusable input.
+    ``"longest"``
+        Keep the longest gap-free stretch and report what was cut, the same
+        trade `steps.steady_state_segment` makes for handling transients.
+        The dropped seconds land in `integrity["discarded_for_gaps_s"]`.
+
+    Small timing jitter (sub-millisecond at 100 Hz) is measured and
+    reported, and the record is placed on a uniform grid at the measured
+    rate; the original timestamps are kept in the `t_hw` column.
+    """
+    if on_gap not in ("raise", "longest"):
+        raise ValueError(f"on_gap must be 'raise' or 'longest', got {on_gap!r}")
+    folder = Path(folder)
+    motion_path = folder / LOGGER_MOTION_FILENAME
+    if not motion_path.is_file():
+        raise FileNotFoundError(motion_path)
+    raw = pd.read_csv(motion_path)
+    missing = [c for c in LOGGER_MOTION_COLUMNS if c not in raw.columns]
+    if missing:
+        raise ValueError(f"{motion_path}: missing logger columns {missing}")
+
+    metadata = None
+    json_path = folder / SESSION_JSON_FILENAME
+    if json_path.is_file():
+        import json
+        with open(json_path, encoding="utf-8") as fh:
+            metadata = json.load(fh)
+
+    t_hw = raw[LOGGER_TIME_COLUMN].to_numpy(float)
+    n_rows_written = len(raw)
+    ts = check_timestamps(t_hw, gap_multiple)
+    if not np.isfinite(ts["measured_fs_hz"]):
+        raise ValueError(f"{motion_path}: cannot measure a sample rate from its timestamps")
+
+    discarded_for_gaps = 0.0
+    if ts["n_gaps"] or ts["n_nonmonotonic"]:
+        if on_gap == "raise":
+            raise ValueError(
+                f"{folder.name}: {ts['n_gaps']} gap(s) (largest {ts['largest_gap_s']:.3f}s) and "
+                f"{ts['n_nonmonotonic']} non-monotonic interval(s) in motion.csv. The filters "
+                f"assume uniform sampling, so this session cannot be analysed as one record. "
+                f"Pass on_gap='longest' to keep the longest clean stretch."
+            )
+        # Split at every gap or reversal and keep the longest piece.
+        d = np.diff(t_hw)
+        breaks = np.flatnonzero((d > gap_multiple * ts["median_interval_s"]) | (d <= 0)) + 1
+        edges = np.r_[0, breaks, len(t_hw)]
+        pieces = [(int(a), int(b)) for a, b in zip(edges[:-1], edges[1:]) if b > a]
+        a, b = max(pieces, key=lambda p: p[1] - p[0])
+        discarded_for_gaps = float((t_hw[-1] - t_hw[0]) - (t_hw[b - 1] - t_hw[a]))
+        raw = raw.iloc[a:b].reset_index(drop=True)
+        t_hw = t_hw[a:b]
+        ts = check_timestamps(t_hw, gap_multiple)
+
+    fs_hz = float(ts["measured_fs_hz"])
+    df = pd.DataFrame(index=pd.Index(np.arange(len(raw), dtype=float) / fs_hz, name="t_s"))
+    roll, pitch, yaw = quaternion_to_euler(raw["qw"], raw["qx"], raw["qy"], raw["qz"])
+    df["attitude.roll"], df["attitude.pitch"], df["attitude.yaw"] = roll, pitch, yaw
+    for src, dst in LOGGER_TO_DEVICE_MOTION.items():
+        df[dst] = raw[src].to_numpy(float)
+    df = df[DEVICE_MOTION_COLUMNS].copy()
+    df["t_hw"] = t_hw - t_hw[0]
+
+    # File-level checks reuse the MotionSense machinery, then the timestamp
+    # facts replace the "not measurable" placeholders it writes.
+    integrity = check_integrity(df[DEVICE_MOTION_COLUMNS].reset_index(drop=True), fs_hz, None)
+    integrity.update({
+        "has_timestamp_column": True,
+        "timestamp_irregularities_detectable": True,
+        "measured_fs_hz": fs_hz,
+        "jitter_ms": ts["jitter_ms"],
+        "n_gaps": ts["n_gaps"],
+        "largest_gap_s": ts["largest_gap_s"],
+        "n_dropped_estimate": ts["n_dropped_estimate"],
+        "n_nonmonotonic": ts["n_nonmonotonic"],
+        "timestamps_uniform": ts["uniform"],
+        "discarded_for_gaps_s": discarded_for_gaps,
+        "duration_s": float(t_hw[-1] - t_hw[0]) if len(t_hw) > 1 else 0.0,
+    })
+    if metadata is not None:
+        # Cross-check the app's own bookkeeping against the file it wrote.
+        n_meta = metadata.get("motionSampleCount")
+        integrity["metadata_sample_count"] = n_meta
+        integrity["metadata_count_matches"] = (int(n_meta) == n_rows_written) if n_meta is not None else None
+        integrity["metadata_gap_count"] = metadata.get("motionGapCount")
+        integrity["metadata_in_progress"] = bool(metadata.get("inProgress", False))
+        integrity["metadata_achieved_hz"] = metadata.get("achievedMotionHz")
+    problems = [p for p in [integrity["problems"]] if p]
+    if ts["n_gaps"]:
+        problems.append(f"{ts['n_gaps']} gap(s)")
+    if discarded_for_gaps > 0:
+        problems.append(f"cut at gaps: {discarded_for_gaps:.1f}s discarded")
+    if ts["n_dropped_estimate"]:
+        problems.append(f"~{ts['n_dropped_estimate']} sample(s) dropped below the gap threshold")
+    if ts["n_nonmonotonic"]:
+        problems.append(f"{ts['n_nonmonotonic']} non-monotonic")
+    if integrity.get("metadata_in_progress"):
+        problems.append("session.json marked in-progress (app did not finish the session)")
+    integrity["problems"] = "; ".join(problems)
+    integrity["clean"] = not problems
+
+    gps, gps_info = load_logger_gps(folder)
+    integrity.update(gps_info)
+
+    label = (metadata or {}).get("label") or "session"
+    return Trial(
+        ident=TrialID(activity=label, trial=0, subject=0, session_id=folder.name),
+        fs_hz=fs_hz,
+        df=df,
+        path=motion_path,
+        integrity=integrity,
+        gps=gps,
+        metadata=metadata,
+    )
+
