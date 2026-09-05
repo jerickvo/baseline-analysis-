@@ -65,7 +65,11 @@ def test_degenerate_check_is_scale_free(amplitude):
 
 
 def test_degenerate_horizontal_accel_is_not_well_conditioned():
-    """FIXED: a rank-deficient horizontal matrix has an undefined ratio."""
+    """FIXED: an input with no horizontal power at all has no axis (ratio NaN).
+
+    Note the distinction, pinned in test_audit_regressions: power on exactly
+    one axis is *perfectly* determined (ratio +inf), not undefined.
+    """
     est = orientation.forward_axis(
         np.ones((1000, 3)), np.array([0.0, 0.0, 1.0]), FS_HZ, method="pca"
     )

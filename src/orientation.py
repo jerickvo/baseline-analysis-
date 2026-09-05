@@ -56,6 +56,25 @@ HARMONIC_REL_BW = 0.10
 # below that the "dominant" axis is not meaningfully dominant.
 FORWARD_CONDITIONING_MIN_RATIO = 4.0
 
+# The trial-constant forward axis must also hold still across the trial.
+# Re-estimated on overlapping windows and compared to the trial-level axis,
+# its 95th-percentile deviation is held to the same 10 deg crosstalk bound
+# as the vertical: a forward axis that wanders more than that leaks a
+# comparable fraction of forward into ML and vice versa, so the horizontal
+# split is not a fixed frame even if each window's estimate is sharp.
+FORWARD_DRIFT_MAX_P95_DEG = FRAME_STABLE_TILT_P95_DEG
+
+# Band used for the regularity / symmetry autocorrelation, as multiples of
+# f_step. The lower edge must sit well BELOW the stride subharmonic
+# (0.5 f_step): that component is exactly what makes consecutive steps
+# differ, and placing the corner on it (as 0.5 x did) attenuated it 6 dB
+# after the zero-phase double pass and biased the step symmetry index
+# upward by +0.04 median, +0.12 max across the 48 trials. At 0.3 x the
+# subharmonic is passed within 0.1 dB. The upper edge keeps the fundamental
+# and three harmonics, ample waveform shape.
+PERIODICITY_BAND_LOW_MULTIPLE = 0.3
+PERIODICITY_BAND_HIGH_MULTIPLE = 4.0
+
 # Periodicity acceptance thresholds for the resolved vertical acceleration.
 # The test is applied at the *stride* lag (two step periods), which is the
 # true repeat period of gait: left and right steps are not required to be
@@ -162,37 +181,69 @@ def horizontal_basis(up: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return e1, e2
 
 
-def project_horizontal(vectors: np.ndarray, up: np.ndarray) -> np.ndarray:
-    """Remove the `up` component from each row of an (n,3) array."""
-    v = np.asarray(vectors, float)
-    up = np.asarray(up, float)
-    up = up / np.linalg.norm(up)
-    return v - np.outer(v @ up, up)
-
-
 def _principal_axis_2d(m: np.ndarray, rel_tol: float = 1e-12) -> tuple[np.ndarray, float]:
     """Principal eigenvector of a 2x2 symmetric matrix, plus eigenvalue ratio.
 
-    A non-positive or numerically negligible secondary eigenvalue means the
-    horizontal power matrix is rank-deficient: there is no second axis for
-    the first to be dominant *over*. The ratio is then **undefined**, not
-    infinite, and NaN is returned deliberately -- it compares False against
-    every `>=`, so `well_conditioned` comes out False. Returning `inf` here
-    inverted the semantics, passing the conditioning check for exactly the
-    degenerate input that check exists to reject.
+    Three regimes, and the ratio must distinguish them:
 
-    `rel_tol` is relative to the leading eigenvalue, so the test scales with
-    the signal's power and catches a secondary eigenvalue that is positive
-    only through floating-point noise. An all-zero matrix makes both
-    eigenvalues 0 and is caught by the same comparison.
+    * **No power on either axis** (both eigenvalues zero, e.g. a constant
+      input): there is nothing to find. Ratio is NaN, which compares False
+      against every ``>=``, so `well_conditioned` comes out False.
+    * **Power on one axis only** (secondary eigenvalue negligible relative to
+      the leading one): the motion is single-axis, and the axis is as well
+      determined as it can possibly be. Ratio is +inf, which passes the
+      conditioning test. An earlier version returned NaN here as well, on
+      the reasoning that a degenerate second eigenvalue is "undefined" --
+      which failed the cleanest possible input (a synthetic runner with
+      fore-aft on exactly one axis reported `well_conditioned=False`).
+    * **Power on both** -- the ordinary case: the ratio itself.
+
+    `rel_tol` is relative to the leading eigenvalue, so the single-axis test
+    scales with signal power and catches a secondary eigenvalue that is
+    positive only through floating-point noise.
     """
     w, v = np.linalg.eigh(m)
     order = np.argsort(w)[::-1]
     w = w[order]
     v = v[:, order]
-    if not np.isfinite(w).all() or w[1] <= rel_tol * abs(w[0]):
+    if not np.isfinite(w).all() or w[0] <= 0:
         return v[:, 0], float("nan")
+    if w[1] <= rel_tol * w[0]:
+        return v[:, 0], float("inf")
     return v[:, 0], float(w[0] / w[1])
+
+
+def _principal_horizontal_axis(
+    x1: np.ndarray, x2: np.ndarray, fs_hz: float, method: str, f_step_hz: float
+) -> tuple[np.ndarray, float]:
+    """Principal axis of two horizontal channels, as (axis2, eigenvalue ratio).
+
+    Shared by `forward_axis` (channels from a fixed basis in the trial-mean
+    horizontal plane) and `mediolateral_cross_check` in tracking mode
+    (channels from the per-sample resolved frame).
+    """
+    if method == "pca":
+        m = np.cov(np.vstack([x1, x2]))
+    elif method == "step_band":
+        from scipy import signal as _sig
+
+        nps = dsp._nperseg(len(x1), fs_hz)
+        f, p11 = _sig.welch(x1 - x1.mean(), fs=fs_hz, nperseg=nps)
+        _, p22 = _sig.welch(x2 - x2.mean(), fs=fs_hz, nperseg=nps)
+        _, p12 = _sig.csd(x1 - x1.mean(), x2 - x2.mean(), fs=fs_hz, nperseg=nps)
+        bw = HARMONIC_REL_BW * f_step_hz
+        sel = (f >= f_step_hz - bw) & (f <= f_step_hz + bw)
+        if not sel.any():  # short record: widen to the nearest bin
+            sel = np.zeros_like(f, dtype=bool)
+            sel[int(np.argmin(np.abs(f - f_step_hz)))] = True
+        # Real part only: the in-phase co-spectrum is what a fixed spatial
+        # axis produces. The quadrature part describes elliptical (rotating)
+        # motion and has no single axis to report.
+        c = float(np.real(p12[sel]).sum())
+        m = np.array([[float(p11[sel].sum()), c], [c, float(p22[sel].sum())]])
+    else:
+        raise ValueError(f"unknown method {method!r}")
+    return _principal_axis_2d(m)
 
 
 def forward_axis(
@@ -221,6 +272,11 @@ def forward_axis(
         rejects everything outside the band that broadband PCA is forced to
         fit, and is far better conditioned in practice.
 
+    `f_step_hz` should be the step frequency measured on the vertical
+    channel the rest of the pipeline uses; `build_frame` supplies it. The
+    fallback here projects onto the trial-mean up, which on a swinging
+    sensor can put its spectral peak on a harmonic.
+
     Returns the axis (unresolved sign), the eigenvalue ratio that says how
     dominant it really is, and the estimated step frequency used.
     """
@@ -233,29 +289,7 @@ def forward_axis(
     if f_step_hz is None:
         f_step_hz = dsp.spectral_peak(a @ up, fs_hz)["f_peak_hz"]
 
-    if method == "pca":
-        m = np.cov(np.vstack([x1, x2]))
-    elif method == "step_band":
-        from scipy import signal as _sig
-
-        nps = dsp._nperseg(len(x1), fs_hz)
-        f, p11 = _sig.welch(x1 - x1.mean(), fs=fs_hz, nperseg=nps)
-        _, p22 = _sig.welch(x2 - x2.mean(), fs=fs_hz, nperseg=nps)
-        _, p12 = _sig.csd(x1 - x1.mean(), x2 - x2.mean(), fs=fs_hz, nperseg=nps)
-        bw = HARMONIC_REL_BW * f_step_hz
-        sel = (f >= f_step_hz - bw) & (f <= f_step_hz + bw)
-        if not sel.any():  # short record: widen to the nearest bin
-            sel = np.zeros_like(f, dtype=bool)
-            sel[int(np.argmin(np.abs(f - f_step_hz)))] = True
-        # Real part only: the in-phase co-spectrum is what a fixed spatial
-        # axis produces. The quadrature part describes elliptical (rotating)
-        # motion and has no single axis to report.
-        c = float(np.real(p12[sel]).sum())
-        m = np.array([[float(p11[sel].sum()), c], [c, float(p22[sel].sum())]])
-    else:
-        raise ValueError(f"unknown method {method!r}")
-
-    axis2, ratio = _principal_axis_2d(m)
+    axis2, ratio = _principal_horizontal_axis(x1, x2, fs_hz, method, f_step_hz)
     axis = axis2[0] * e1 + axis2[1] * e2
     axis /= np.linalg.norm(axis)
     return {
@@ -360,6 +394,16 @@ def build_frame(
     a = np.asarray(user_accel, float)
     up = vertical_axis(gravity)
 
+    if f_step_hz is None:
+        # Measure the step frequency on the SAME vertical channel the
+        # verifier and stage 3 use. Taking it from the static projection
+        # `a @ up` let jog_16/sub_1 build its forward axis in a band centred
+        # on the 1.5 x f harmonic (4.16 Hz) while everything downstream ran
+        # at the 2.78 Hz fundamental, and nothing reported the mismatch.
+        f_step_hz = dsp.spectral_peak(
+            vertical_component(a, gravity, mode=mode), fs_hz
+        )["f_peak_hz"]
+
     fwd_est = forward_axis(a, up, fs_hz, method=forward_method, f_step_hz=f_step_hz)
     sign = resolve_forward_sign(a, up, fwd_est["axis"], fs_hz, fwd_est["f_step_hz"])
     forward = sign["axis"]
@@ -373,6 +417,13 @@ def build_frame(
     R = np.vstack([forward, ml, up])
 
     up_series = vertical_axis_series(gravity) if mode == "tracking" else None
+    # Samples where instantaneous up is (numerically) parallel to forward:
+    # there `resolve` cannot define a forward direction and substitutes an
+    # arbitrary horizontal one. Zero on any real placement; counted so a
+    # caller can see if it ever is not.
+    n_degenerate = (
+        int((1.0 - (up_series @ forward) ** 2 < 1e-12).sum()) if up_series is not None else 0
+    )
 
     diagnostics = {
         "forward_method": forward_method,
@@ -385,6 +436,7 @@ def build_frame(
         "forward_sign_split_half_consistent": sign["split_half_consistent"],
         "orthonormal_residual": float(np.abs(R @ R.T - np.eye(3)).max()),
         "right_handed": bool(np.linalg.det(R) > 0),
+        "degenerate_forward_samples": n_degenerate,
     }
     return AnatomicalFrame(
         up=up,
@@ -420,11 +472,16 @@ def resolve(vectors: np.ndarray, frame: AnatomicalFrame) -> np.ndarray:
     f_t = frame.forward - (up_t @ frame.forward)[:, None] * up_t
     norm = np.linalg.norm(f_t, axis=1, keepdims=True)
     degenerate = norm[:, 0] < 1e-6
-    f_t = np.where(
-        degenerate[:, None],
-        frame.forward,
-        f_t / np.where(degenerate[:, None], 1.0, norm),
-    )
+    f_t = f_t / np.where(degenerate[:, None], 1.0, norm)
+    if degenerate.any():
+        # Forward is undefined where up || forward. Substituting the
+        # un-projected static forward (as before) made the triad
+        # non-orthonormal there and produced NaN at exact parallelism. Use
+        # an arbitrary horizontal direction instead: the forward/ML split
+        # is meaningless at those samples either way, but the triad stays a
+        # rotation so no component is scaled or lost. The count is in
+        # frame.diagnostics["degenerate_forward_samples"].
+        f_t[degenerate] = np.array([horizontal_basis(u)[0] for u in up_t[degenerate]])
     ml_t = np.cross(up_t, f_t)
     ml_t /= np.linalg.norm(ml_t, axis=1, keepdims=True)
     comp_fwd = np.einsum("ij,ij->i", v, f_t)
@@ -526,20 +583,63 @@ def mediolateral_cross_check(
     axis carrying most stride-rate power should be roughly perpendicular
     (~90 deg) to the axis carrying most step-rate power.
 
-    If the measured angle is near 0 deg instead, both harmonics ride on the
-    same physical axis, the prediction does not hold at this placement, and
-    the mediolateral axis is an unverified construction of the cross product.
+    Two things must both hold for the check to pass:
+
+    * the stride-rate axis is itself *determined* (eigenvalue ratio at or
+      above `FORWARD_CONDITIONING_MIN_RATIO`). An undetermined axis points
+      somewhere random, and lands 60 deg or more from the step axis about a
+      third of the time -- which is exactly how this dataset's only two
+      "ok" verdicts were produced (stride-axis ratios 2.05 and 2.49, while
+      all 41 trials with a determined stride axis failed). Those are now
+      reported as ``stride_axis_undetermined``, not as passes.
+    * the angle is >= 60 deg (90 deg predicted, +/- 30 deg for estimation
+      noise).
+
+    In tracking mode the two axes are measured on the per-sample resolved
+    horizontal channels, not by projecting onto the trial-mean up. A sensor
+    pitching +/-20 deg at stride rate leaks vertical acceleration into the
+    mean-plane stride band along the pitch axis and collapsed the angle from
+    90 to 48 deg on a frame whose tracking resolution was exact to 1e-8 g;
+    on the resolved channels the same synthetic gives 90 deg at any pitch.
     """
     a = np.asarray(user_accel, float)
-    step_axis = forward_axis(a, frame.up, fs_hz, "step_band", f_step_hz)
-    stride_axis = forward_axis(a, frame.up, fs_hz, "step_band", f_step_hz / 2.0)
-    ang = dsp.axis_angle_deg(step_axis["axis"], stride_axis["axis"])
+    if frame.mode == "tracking" and frame.up_series is not None:
+        h = resolve(a, frame)[:, :2]
+        step_axis2, step_ratio = _principal_horizontal_axis(h[:, 0], h[:, 1], fs_hz, "step_band", f_step_hz)
+        stride_axis2, stride_ratio = _principal_horizontal_axis(h[:, 0], h[:, 1], fs_hz, "step_band", f_step_hz / 2.0)
+        c = abs(float(step_axis2 @ stride_axis2))
+        ang = float(np.degrees(np.arccos(np.clip(c, 0.0, 1.0))))
+    else:
+        step_axis = forward_axis(a, frame.up, fs_hz, "step_band", f_step_hz)
+        stride_axis = forward_axis(a, frame.up, fs_hz, "step_band", f_step_hz / 2.0)
+        step_ratio, stride_ratio = step_axis["eigenvalue_ratio"], stride_axis["eigenvalue_ratio"]
+        ang = dsp.axis_angle_deg(step_axis["axis"], stride_axis["axis"])
+
+    stride_determined = bool(stride_ratio >= FORWARD_CONDITIONING_MIN_RATIO)
+    if not stride_determined:
+        state = "stride_axis_undetermined"
+    elif ang >= 60.0:
+        state = "supported"
+    else:
+        state = "unsupported"
     return {
         "step_stride_axis_angle_deg": ang,
-        "stride_axis_eigenvalue_ratio": stride_axis["eigenvalue_ratio"],
-        # 90 deg is the prediction; allow +/- 30 deg for estimation noise.
-        "ml_independently_supported": bool(ang >= 60.0),
+        "step_axis_eigenvalue_ratio": float(step_ratio),
+        "stride_axis_eigenvalue_ratio": float(stride_ratio),
+        "stride_axis_well_conditioned": stride_determined,
+        "ml_check_state": state,
+        "ml_independently_supported": state == "supported",
     }
+
+
+def _autocorr_at_lag(lags: np.ndarray, ac: np.ndarray, target_s: float, fs_hz: float) -> float:
+    """Autocorrelation at a fractional lag, by parabolic interpolation."""
+    i = int(np.argmin(np.abs(lags - target_s)))
+    if 0 < i < len(ac) - 1:
+        y0, y1, y2 = float(ac[i - 1]), float(ac[i]), float(ac[i + 1])
+        x = (target_s - lags[i]) * fs_hz  # offset from the centre sample, in samples
+        return y1 + 0.5 * (y2 - y0) * x + 0.5 * (y0 - 2 * y1 + y2) * x * x
+    return float(ac[i])
 
 
 def verify_vertical_periodicity(a_vert: np.ndarray, fs_hz: float) -> dict:
@@ -579,13 +679,19 @@ def verify_vertical_periodicity(a_vert: np.ndarray, fs_hz: float) -> dict:
     # The band keeps the fundamental and three harmonics -- ample waveform
     # shape -- and is expressed as multiples of f_step so it is identical at
     # any sample rate or cadence.
-    lo = 0.5 * f_step
-    hi = min(4.0 * f_step, 0.4 * fs_hz)
+    lo = PERIODICITY_BAND_LOW_MULTIPLE * f_step
+    hi = min(PERIODICITY_BAND_HIGH_MULTIPLE * f_step, 0.4 * fs_hz)
     a_band = dsp.bandpass(a_vert, fs_hz, lo, hi) if hi > lo else a_vert
     lags, ac = dsp.autocorrelation(a_band, fs_hz, max_lag_s=3.0 * step_period)
 
     def _at(multiple: float) -> float:
-        return float(ac[int(np.argmin(np.abs(lags - multiple * step_period)))])
+        # Read the autocorrelation at the EXACT lag, not the nearest sample.
+        # At 50 Hz the nearest-sample lag is up to 10 ms off a 360 ms step,
+        # which shifted stride regularity by up to 0.058, pushed the symmetry
+        # index above 1 on two trials, and made all three quantities depend
+        # on the sample rate. A parabola through the three nearest points
+        # recovers the value at the fractional lag.
+        return _autocorr_at_lag(lags, ac, multiple * step_period, fs_hz)
 
     step_reg = _at(1.0)
     stride_reg = _at(2.0)
@@ -622,7 +728,10 @@ def verify_frame(
 ) -> dict:
     """Run every stage-2 check and return one verdict plus the evidence.
 
-    `verdict` is deliberately three-valued. "ok" means every check passed.
+    `verdict` is deliberately three-valued. "ok" means every check passed:
+    periodic vertical, a dominant AND stable forward axis, and a mediolateral
+    axis confirmed by a determined stride-rate axis ~90 deg from the step
+    axis.
     "vertical_only" means the vertical axis is sound and periodic but the
     horizontal split is not supported -- downstream code may use vertical
     acceleration and must not use forward/ML. "failed" means the vertical
@@ -633,8 +742,20 @@ def verify_frame(
     stab = frame_stability(user_accel, gravity, fs_hz, forward_method=frame.diagnostics["forward_method"])
     ml = mediolateral_cross_check(user_accel, frame, fs_hz, per["f_step_hz"])
 
+    # The forward axis must be dominant, stable across the trial, AND the
+    # ML axis must pass its independent check. Stability was measured but
+    # never consulted before: 30/48 trials had a well-conditioned forward
+    # axis wandering more than 10 deg (p95 up to 86 deg) and nothing in the
+    # verdict said so. A trial too short to measure stability (< 8 s, zero
+    # windows) cannot be "ok" either: unmeasured is not the same as stable.
+    forward_stable = bool(
+        stab["n_stability_windows"] > 0
+        and stab["forward_drift_p95_deg"] <= FORWARD_DRIFT_MAX_P95_DEG
+    )
     horizontal_ok = bool(
-        frame.diagnostics["forward_well_conditioned"] and ml["ml_independently_supported"]
+        frame.diagnostics["forward_well_conditioned"]
+        and forward_stable
+        and ml["ml_independently_supported"]
     )
     if not per["periodicity_ok"]:
         verdict = "failed"
@@ -658,7 +779,23 @@ def verify_frame(
             f"(eigenvalue ratio {frame.diagnostics['forward_eigenvalue_ratio']:.1f} "
             f"< {FORWARD_CONDITIONING_MIN_RATIO})"
         )
-    if not ml["ml_independently_supported"]:
+    if stab["n_stability_windows"] == 0:
+        reasons.append(
+            "trial too short to measure forward-axis stability "
+            f"(< {STABILITY_WINDOW_S:g} s): horizontal split cannot be verified"
+        )
+    elif stab["forward_drift_p95_deg"] > FORWARD_DRIFT_MAX_P95_DEG:
+        reasons.append(
+            f"forward axis wanders {stab['forward_drift_p95_deg']:.0f} deg (p95) across "
+            f"windows (> {FORWARD_DRIFT_MAX_P95_DEG:g}): not a fixed horizontal frame"
+        )
+    if ml["ml_check_state"] == "stride_axis_undetermined":
+        reasons.append(
+            f"stride-rate horizontal axis is undetermined (eigenvalue ratio "
+            f"{ml['stride_axis_eigenvalue_ratio']:.1f} < {FORWARD_CONDITIONING_MIN_RATIO}): "
+            f"mediolateral axis cannot be verified"
+        )
+    elif not ml["ml_independently_supported"]:
         reasons.append(
             f"step-rate and stride-rate horizontal axes are {ml['step_stride_axis_angle_deg']:.0f} deg "
             f"apart, not ~90 deg: mediolateral axis is unverified"
@@ -674,7 +811,7 @@ def verify_frame(
                 f"NOTE (not a failure): vertical wanders "
                 f"{stab['vertical_tilt_p95_deg']:.0f} deg (p95) within the trial, so a "
                 f"trial-constant rotation would be invalid here; tracking mode is in use, "
-                f"which removes that error"
+                f"which corrects the vertical channel and the per-sample horizontal plane"
             )
     if not frame.diagnostics["forward_sign_confident"]:
         reasons.append("forward sign (front vs back) is not resolved with confidence")

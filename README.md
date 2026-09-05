@@ -6,8 +6,8 @@ Signal-processing core for a running gait analysis system, prototyped in plain P
 This is a **prototyping repo**, not an app. Scripts and notebooks over CSV. No mobile code.
 
 **Read [`REPORT.md`](REPORT.md) for the findings** — which stages work, which are shaky,
-which failed, where pocket placement and 50 Hz are doing load-bearing work, and what this
-dataset fundamentally cannot answer.
+which failed, where pocket placement and 50 Hz are doing load-bearing work, what this
+dataset fundamentally cannot answer, and (§9) what the audit changed and why.
 
 ## The data, and what it is for
 
@@ -34,7 +34,7 @@ export MOTIONSENSE_ROOT=$PWD/data/motion-sense/data   # or leave unset; the load
 ```bash
 python scripts/run_all.py                 # all 48 trials -> reports/*.csv, figures, verdict summary
 python scripts/run_invariance_checks.py   # rotation + resample sweep -> reports/invariance.csv
-python -m pytest tests/                   # 10 tests, incl. orientation and rate invariance
+python -m pytest tests/                   # 106 tests; synthetic ones run without the dataset, real-trial ones skip
 jupyter notebook notebooks/gait_pipeline_walkthrough.ipynb   # one subject, every stage, plots
 ```
 
@@ -56,7 +56,10 @@ scripts/
 notebooks/
   gait_pipeline_walkthrough.ipynb   one subject end to end, plots at every stage
 tests/
+  conftest.py              real-trial tests skip (not fail) when the dataset is absent
   test_invariance.py       the tests behind the "placement- and rate-agnostic" claim
+  test_failure_modes.py    degenerate, short and lying input; xfail = confirmed unfixed bug
+  test_audit_regressions.py  one synthetic test per defect found and fixed in the audit
 reports/                   generated CSVs and figures
 REPORT.md                  findings
 ```
@@ -65,7 +68,7 @@ REPORT.md                  findings
 
 - **Sample rate is a parameter everywhere.** The number 50 appears once in the package
   (`loader.DEFAULT_FS_HZ`) and only as a default argument. Verified by resampling all 48
-  trials to 25 / 100 / 200 Hz: cadence moves by a median of 0.03–0.05%, worst case 0.79%.
+  trials to 25 / 100 / 200 Hz: cadence moves by a median of 0.03–0.06%, worst case 0.79%.
 - **Filter cutoffs are multiples of the estimated step frequency**, never fixed Hz, so the
   filter is identical in relative terms at any cadence and any rate.
 - **Every cutoff, threshold and window length has a comment saying why that value.** Where
@@ -82,11 +85,11 @@ REPORT.md                  findings
 |---|---|
 | Trials analysed | 48 (24 subjects × 2 jog trials), all files clean |
 | Cadence | 148.5–183.7 spm; **47/48** inside 150–190 spm |
-| Detector vs independent spectral estimate | agrees within 4% on every trial |
+| Detector vs spectral estimate | within 3.9% on every trial — a consistency check, not independent confirmation: the detector's band is centred on the spectral estimate |
 | Flagged trials | 1 (`jog_9/sub_4`, 148.5 spm) — attributed to the **trial**, not the algorithm |
-| Stage-2 verdicts | 2 `ok`, 46 `vertical_only`, 0 `failed` |
+| Stage-2 verdicts | 0 `ok`, 48 `vertical_only`, 0 `failed` — the two earlier `ok`s were chance passes on undetermined stride axes |
 | Static trial-constant frame valid | **0/48** — the pocket sensor tilts 15° median, 30° p95 within a trial |
-| Mediolateral cross-check | passes **2/48** — the ML axis is unverified at this placement |
+| Mediolateral cross-check | passes **1/48**, and that trial's forward axis drifts 15° — the ML axis is unverified at this placement |
 | Left/right alternation at detected contact | median 0.485, *below* its own surrogate null (0.561) |
 | Orientation invariance | exact: 0.00 spm cadence change, 144/144 runs |
 

@@ -27,8 +27,28 @@ STEP_FREQ_SEARCH_BAND_HZ = (1.2, 4.5)
 
 
 def _nperseg(n: int, fs_hz: float, seconds: float = WELCH_SEGMENT_SECONDS) -> int:
-    """Welch segment length in samples, clipped to the record length."""
-    return int(max(8, min(n, round(seconds * fs_hz))))
+    """Welch segment length in samples, chosen so the segments TILE the record.
+
+    `scipy.signal.welch` silently drops every trailing sample that does not
+    fill a segment. With a fixed 16 s length and 50% overlap that discarded
+    up to 7 s -- 30% of a short trial, > 4 s on 15 of the 48 -- and the
+    spectral cadence is supposed to audit the detector over the same span
+    the detector saw. So take the number of 16 s segments that fit, then
+    stretch the segment length so that many segments at 50% overlap cover
+    the whole record (k segments of length L cover L (k + 1) / 2 samples).
+    Segments end up 16-24 s long; the parabolic peak refinement makes the
+    small change in bin spacing immaterial.
+    """
+    target = int(max(8, min(n, round(seconds * fs_hz))))
+    if target >= n:
+        return target
+    half = target // 2
+    k = max(1, (n - half) // (target - half))
+    # Even length, so the 50% overlap is exact and k segments cover exactly
+    # L (k + 1) / 2 <= n samples: an odd L rounds the overlap down and can
+    # lose a whole segment (n = 5535 gave L = 851, which fits only 11 of the
+    # 12 intended segments and dropped 424 samples).
+    return int(max(8, min(n, 2 * (n // (k + 1)))))
 
 
 def robust_sigma(x: np.ndarray) -> float:
@@ -172,7 +192,11 @@ def autocorrelation(x: np.ndarray, fs_hz: float, max_lag_s: float) -> tuple[np.n
 
 
 def rotation_matrix_from_axis_angle(axis: np.ndarray, angle_rad: float) -> np.ndarray:
-    """Rodrigues' formula. Used for the orientation-invariance test."""
+    """Rodrigues' formula: rotation by `angle_rad` about `axis`.
+
+    Used by the tests to build specific placements (upside-down, yawed 180
+    deg) where `random_rotation_matrix` gives only unnamed ones.
+    """
     a = np.asarray(axis, dtype=float)
     a = a / np.linalg.norm(a)
     K = np.array([[0, -a[2], a[1]], [a[2], 0, -a[0]], [-a[1], a[0], 0]])

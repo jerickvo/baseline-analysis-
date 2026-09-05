@@ -32,6 +32,13 @@ def run_trial(
     """
     tr = loader.load_trial(activity, trial, subject, root, fs_hz)
     fs = tr.fs_hz
+    # Refuse hard corruption up front, naming it. Before, a NaN sample sailed
+    # past the integrity record (which nothing read), silently disabled the
+    # steady-state trim, and finally raised from deep inside spectral_peak.
+    # Soft findings (a short flatline, gravity magnitude off unit) proceed
+    # and travel with the result as `file_clean` / `file_problems`.
+    if tr.integrity["n_nan"] or tr.integrity["n_inf"] or tr.integrity["index_contiguous"] is False:
+        raise ValueError(f"{tr.ident}: unusable file: {tr.integrity['problems']}")
 
     # --- stage 3a: trim handling transients. Done on rotation-invariant
     # acceleration magnitude, so it is independent of stage 2.
@@ -41,7 +48,8 @@ def run_trial(
         seg = {
             "start": 0, "stop": tr.n_samples, "segmented": False,
             "trimmed_start_s": 0.0, "trimmed_end_s": 0.0, "kept_fraction": 1.0,
-            "n_windows": 0,
+            "n_windows": 0, "segments": [(0, tr.n_samples)], "n_active_segments": 1,
+            "active_seconds": tr.duration_s, "kept_fraction_of_active": 1.0,
         }
     sl = slice(seg["start"], seg["stop"])
     accel = tr.user_accel[sl]
@@ -58,6 +66,14 @@ def run_trial(
     verify = orientation.verify_frame(accel, gravity, frame, fs)
     a_vert = verify["a_vertical"]
     resolved = orientation.resolve(accel, frame)
+
+    # The forward axis must have been built in the band the verifier and
+    # stage 3 use. `build_frame` now measures f_step on the same vertical
+    # channel, so this should never trip; it is checked rather than assumed.
+    f_step_used = frame.diagnostics["f_step_hz_used"]
+    f_step_mismatch = bool(
+        abs(f_step_used / verify["periodicity"]["f_step_hz"] - 1.0) > orientation.HARMONIC_REL_BW
+    )
 
     # --- stage 3b: steps and cadence
     f_step = verify["periodicity"]["f_step_hz"]
@@ -76,6 +92,9 @@ def run_trial(
         irregular_step_fraction=summary["irregular_step_fraction"],
         sample_rate_plausible=rate_check["sample_rate_plausible"],
         out_of_band_peak_hz=rate_check["out_of_band_peak_hz"],
+        detection_gap=summary["detection_gap"],
+        largest_interval_step_periods=summary["largest_interval_step_periods"],
+        second_harmonic_ratio=verify["periodicity"]["second_harmonic_ratio"],
     )
     # `cadence_summary` already enforces MIN_STEADY_SECONDS on the step
     # span; this adds the segment-level context to the message.
@@ -97,6 +116,7 @@ def run_trial(
         "segment": seg,
         "steady_seconds": steady_s,
         "steady_too_short": bool(too_short),
+        "frame_f_step_mismatch": f_step_mismatch,
         "frame": frame,
         "verify": verify,
         "resolved": resolved,
@@ -131,9 +151,12 @@ def flatten(result: dict) -> dict:
         "n_samples": tr.n_samples,
         "duration_s": tr.duration_s,
         "file_clean": tr.integrity["clean"],
+        "file_problems": tr.integrity["problems"],
         "trimmed_start_s": result["segment"]["trimmed_start_s"],
         "trimmed_end_s": result["segment"]["trimmed_end_s"],
         "steady_s": result["steady_seconds"],
+        "n_active_segments": result["segment"]["n_active_segments"],
+        "kept_fraction_of_active": result["segment"]["kept_fraction_of_active"],
         # stage 2
         "frame_mode": fr.mode,
         "frame_verdict": v["verdict"],
@@ -141,13 +164,20 @@ def flatten(result: dict) -> dict:
         "forward_eig_ratio": fr.diagnostics["forward_eigenvalue_ratio"],
         "forward_well_conditioned": fr.diagnostics["forward_well_conditioned"],
         "forward_sign_confident": fr.diagnostics["forward_sign_confident"],
+        "f_step_hz_used": fr.diagnostics["f_step_hz_used"],
+        "frame_f_step_mismatch": result["frame_f_step_mismatch"],
+        "degenerate_forward_samples": fr.diagnostics["degenerate_forward_samples"],
         "vertical_tilt_median_deg": stab["vertical_tilt_median_deg"],
         "vertical_tilt_p95_deg": stab["vertical_tilt_p95_deg"],
         "forward_drift_p95_deg": stab["forward_drift_p95_deg"],
+        "n_stability_windows": stab["n_stability_windows"],
         "static_frame_valid": stab["frame_static_valid"],
         "step_stride_axis_angle_deg": v["mediolateral_check"]["step_stride_axis_angle_deg"],
+        "stride_axis_eig_ratio": v["mediolateral_check"]["stride_axis_eigenvalue_ratio"],
+        "ml_check_state": v["mediolateral_check"]["ml_check_state"],
         "ml_independently_supported": v["mediolateral_check"]["ml_independently_supported"],
         "fundamental_power_fraction": per["fundamental_power_fraction"],
+        "second_harmonic_ratio": per["second_harmonic_ratio"],
         "step_regularity": per["step_regularity"],
         "stride_regularity": per["stride_regularity"],
         "step_symmetry_index": per["step_symmetry_index"],
@@ -161,6 +191,8 @@ def flatten(result: dict) -> dict:
         "cadence_cv": cs["cadence_cv"],
         "irregular_step_fraction": cs["irregular_step_fraction"],
         "alternating_interval_asymmetry_abs_pct": cs["alternating_interval_asymmetry_abs_pct"],
+        "largest_interval_step_periods": cs["largest_interval_step_periods"],
+        "detection_gap": cs["detection_gap"],
         "cadence_in_band": cd["cadence_in_expected_band"],
         "detector_spectral_ratio": cd["detector_spectral_ratio"],
         "cadence_flagged": cd["flagged"],

@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 
-from . import dsp, loader, orientation
+from . import loader, orientation, steps
 
 # A short window is used wherever individual steps must be visible: 6 s
 # shows ~17 steps at running cadence, enough to see the pattern and few
@@ -76,12 +75,15 @@ def plot_steady_state(result: dict):
     fig, ax = plt.subplots(figsize=(12, 3.2))
     ax.plot(tr.t, mag, lw=0.5, color="0.6", label="|userAcceleration|")
     if "window_rms" in seg:
-        w = int(round(1.0 * tr.fs_hz))
+        # Read the window and threshold from `steps` so this plot cannot
+        # drift from what the trimmer actually did.
+        w = int(round(steps.STEADY_WINDOW_S * tr.fs_hz))
         centres = (np.arange(len(seg["window_rms"])) + 0.5) * w / tr.fs_hz
-        ax.plot(centres, seg["window_rms"], lw=1.6, color="C0", label="1 s window RMS")
+        ax.plot(centres, seg["window_rms"], lw=1.6, color="C0",
+                label=f"{steps.STEADY_WINDOW_S:g} s window RMS")
         ax.axhline(
-            0.5 * np.median(seg["window_rms"]), color="C3", ls="--", lw=1.2,
-            label="0.5 x median threshold",
+            steps.STEADY_RMS_FRACTION * np.median(seg["window_rms"]), color="C3", ls="--", lw=1.2,
+            label=f"{steps.STEADY_RMS_FRACTION:g} x median threshold",
         )
     ax.axvspan(
         seg["start"] / tr.fs_hz, seg["stop"] / tr.fs_hz, color="C2", alpha=0.15,
@@ -234,13 +236,15 @@ def plot_steps(result: dict, start_s: float = 0.0):
 
     cad = result["cadence_series"]
     axes[1].plot(cad["t_s"], cad["cadence_spm"], ".", ms=3, alpha=0.4, label="instantaneous")
-    axes[1].plot(cad["t_s"], cad["cadence_spm_smooth"], lw=1.8, color="C1", label="5-step median")
+    axes[1].plot(cad["t_s"], cad["cadence_spm_smooth"], lw=1.8, color="C1",
+                 label=f"{steps.CADENCE_SMOOTH_STEPS}-step median")
     axes[1].axhline(cs["cadence_spm"], color="C2", ls="-", label=f"trial {cs['cadence_spm']:.1f} spm")
     axes[1].axhline(
         result["spectral"]["cadence_spm"], color="C4", ls=":",
         label=f"spectral {result['spectral']['cadence_spm']:.1f} spm",
     )
-    axes[1].axhspan(150, 190, color="C2", alpha=0.10, label="expected 150-190 spm")
+    lo_spm, hi_spm = steps.EXPECTED_CADENCE_SPM
+    axes[1].axhspan(lo_spm, hi_spm, color="C2", alpha=0.10, label=f"expected {lo_spm:g}-{hi_spm:g} spm")
     axes[1].set_xlabel("time (s)")
     axes[1].set_ylabel("cadence (spm)")
     axes[1].set_title(f"cadence  |  {cd['diagnosis']}", fontsize=9)
@@ -312,7 +316,8 @@ def plot_cadence_across_subjects(table):
                    label=f"trial {label} (ok)", color=f"C{i}")
         ax.scatter(grp["subject"][~ok], grp["cadence_spm"][~ok], s=90, marker="X",
                    color="C3", label=f"trial {label} (flagged)", zorder=5)
-    ax.axhspan(150, 190, color="C2", alpha=0.12, label="expected 150-190 spm")
+    lo_spm, hi_spm = steps.EXPECTED_CADENCE_SPM
+    ax.axhspan(lo_spm, hi_spm, color="C2", alpha=0.12, label=f"expected {lo_spm:g}-{hi_spm:g} spm")
     ax.set_xlabel("subject")
     ax.set_ylabel("detected cadence (spm)")
     ax.set_xticks(sorted(table["subject"].unique()))

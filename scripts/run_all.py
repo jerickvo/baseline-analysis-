@@ -23,7 +23,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src import lateral, loader, pipeline, plotting  # noqa: E402
+from src import lateral, loader, pipeline, plotting, steps  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 OUT = REPO / "reports"
@@ -76,6 +76,8 @@ def main() -> int:
     table.to_csv(OUT / "pipeline_results.csv", index=False)
     print(f"[stages 2-4] wrote {OUT / 'pipeline_results.csv'} ({len(table)} rows)")
 
+    table, failed = split_failed(table)
+
     print("[figures] rendering walkthrough for "
           f"{args.activity}_{args.figures_trial}/sub_{args.figures_subject} ...")
     res = pipeline.run_trial(
@@ -97,7 +99,27 @@ def main() -> int:
     print(f"  wrote {len(figs)} figures to {OUT / 'figures'}")
 
     print_verdicts(table)
+    if len(failed):
+        print(f"\n[FAILED] {len(failed)} trial(s) raised and are NOT in the counts above:")
+        for _, r in failed.iterrows():
+            print(f"    {r['activity']}_{r['trial']}/sub_{r['subject']}: {r['error']}")
     return 0
+
+
+def split_failed(table: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Separate trials that raised from trials that ran.
+
+    A trial that raised has only its identity and an `error` column; every
+    other column is NaN. Passing those rows into the boolean masks in
+    `print_verdicts` crashed it ("cannot mask with non-boolean array
+    containing NA"), so one bad file killed the whole summary after the
+    CSVs were written. Returns (ran, failed).
+    """
+    if "error" in table:
+        failed = table[table["error"].notna()].reset_index(drop=True)
+        ran = table[table["error"].isna()].reset_index(drop=True)
+        return ran, failed
+    return table, table.iloc[0:0]
 
 
 def print_verdicts(t: pd.DataFrame) -> None:
@@ -120,7 +142,12 @@ def print_verdicts(t: pd.DataFrame) -> None:
           f"p95 {t['vertical_tilt_p95_deg'].median():.1f} deg")
     print(f"  single static rotation valid     {int(t['static_frame_valid'].sum())}/{n}")
     print(f"  forward axis well conditioned    {int(t['forward_well_conditioned'].sum())}/{n}")
-    print(f"  mediolateral independently OK    {int(t['ml_independently_supported'].sum())}/{n}")
+    print(f"  forward axis stable (p95<=10deg) "
+          f"{int((t['forward_drift_p95_deg'] <= 10).sum())}/{n} "
+          f"(median p95 {t['forward_drift_p95_deg'].median():.0f} deg)")
+    print(f"  forward-axis band == verifier    {int((~t['frame_f_step_mismatch']).sum())}/{n}")
+    for state, cnt in t["ml_check_state"].value_counts().items():
+        print(f"  ML check: {state:<24s} {cnt}/{n}")
     print(f"  stride regularity                median {t['stride_regularity'].median():.2f}")
     print(f"  step symmetry index              median {t['step_symmetry_index'].median():.2f} "
           f"(range {t['step_symmetry_index'].min():.2f}-{t['step_symmetry_index'].max():.2f})")
@@ -130,7 +157,10 @@ def print_verdicts(t: pd.DataFrame) -> None:
           f"(median {t['cadence_spm'].median():.1f})")
     print(f"  inside 150-190 spm               {int(t['cadence_in_band'].sum())}/{n}")
     print(f"  detector vs spectral estimate    ratio {t['detector_spectral_ratio'].min():.3f}-"
-          f"{t['detector_spectral_ratio'].max():.3f}")
+          f"{t['detector_spectral_ratio'].max():.3f}  (band-coupled: bounds within-band miscounting only)")
+    print(f"  detection gaps (>{steps.DETECTION_GAP_STEP_PERIODS:g} step periods) {int(t['detection_gap'].sum())}/{n}")
+    print(f"  longest active segment kept      median {100 * t['kept_fraction_of_active'].median():.0f}% of active time, "
+          f"min {100 * t['kept_fraction_of_active'].min():.0f}%")
     flagged = t[t["cadence_flagged"]]
     print(f"  flagged                          {len(flagged)}/{n}")
     for _, r in flagged.iterrows():
@@ -144,6 +174,9 @@ def print_verdicts(t: pd.DataFrame) -> None:
     print(f"  best-phase alternation           median {t['best_phase_alternation'].median():.3f}")
     print(f"  ... vs max-over-phase null       median {t['best_phase_surrogate_max_mean'].median():.3f}")
     print(f"  ... exceeds that null's p95      {int(t['best_phase_beats_surrogate_p95'].sum())}/{n}")
+    print("      (phase-randomised null does NOT preserve step-locking: a pure stride-rate")
+    print("       sinusoid locked to the steps, with no laterality, beats it on 22/24 synthetic")
+    print("       runs -- so this line shows step-locked periodicity, not laterality)")
     print(f"  alternation range over phase     median {t['alternation_phase_range'].median():.3f}")
     print("  NO ACCURACY IS CLAIMED: consistency is not correctness.")
 

@@ -52,21 +52,26 @@ MIN_STEADY_SECONDS = 5.0
 # sample rate -- the requirement that nothing hardcode 50 Hz.
 #
 # High-pass at 0.7 x f_step: sits between the stride subharmonic (0.5
-# f_step) and the fundamental. A 4th-order Butterworth puts the subharmonic
-# down ~12 dB while costing the fundamental 0.25 dB. That subharmonic is
-# the step-to-step asymmetry term; leaving it in makes alternate peaks
+# f_step) and the fundamental. The order-4 Butterworth band-pass built by
+# `dsp.bandpass` puts the subharmonic down 24 dB per pass (48 dB after the
+# zero-phase double pass) while costing the fundamental under 0.05 dB
+# (measured with sosfreqz; an earlier comment said 12 dB / 0.25 dB, which
+# understated the single-pass figures by 2x). That subharmonic is the
+# step-to-step asymmetry term; leaving it in makes alternate peaks
 # systematically shorter and invites missed steps. It also kills any DC
 # offset left by imperfect gravity removal.
 HIGHPASS_STEP_FREQ_MULTIPLE = 0.7
 # Low-pass at 1.5 x f_step: keeps the fundamental, excludes the second
-# harmonic. Measured on this dataset the second harmonic carries up to 21%
-# of fundamental power, and passing it puts a genuine *second* crest inside
-# every step cycle -- ensemble-averaging the step cycle shows 2.0 peaks per
-# cycle at a 3 x f_step cutoff versus 1.0 at 1.5 x. Sweeping the cutoff
-# against an independent spectral cadence estimate, 1.5 x gave 1.1% median
-# error and was the only setting insensitive to the peak-spacing
-# constraint, i.e. it rejects the harmonic on filter shape alone rather
-# than leaning on the minimum-distance rule to hide it.
+# harmonic (down 22 dB per pass). Measured on this dataset the second
+# harmonic carries a median of 11.6% of fundamental power and up to 67%;
+# passing it can put a genuine *second* crest inside the step cycle (the
+# drift-free ensemble-averaged cycle shows two crests on 3/48 trials at a
+# 3 x f_step cutoff and on none at 1.5 x). Sweeping the cutoff against the
+# spectral cadence estimate, 1.5 x gave 0.58% median error and was the only
+# setting insensitive to the peak-spacing constraint (disabling that rule
+# leaves 1.5 x unchanged, degrades 2.0 x by 2.4x and 3.0 x by 30x), i.e. it
+# rejects the harmonic on filter shape alone rather than leaning on the
+# minimum-distance rule to hide it.
 LOWPASS_STEP_FREQ_MULTIPLE = 1.5
 # Never let the low cutoff approach Nyquist. 0.4 x fs leaves the Butterworth
 # transition band comfortably inside the spectrum; matters at low rates or
@@ -85,7 +90,8 @@ MIN_PEAK_DISTANCE_STEP_PERIODS = 0.6
 # filtered trace. 0.5 sigma accepts the weaker step of an asymmetric pair
 # -- essential here, where the two steps of a stride differ substantially
 # -- while rejecting ripple. Raising it to 1.5 multiplied the disagreement
-# with the spectral cadence estimate by 5 by starting to drop alternate steps.
+# with the spectral cadence estimate by 5.0 (0.58% -> 2.90% median) by
+# starting to drop alternate steps.
 PEAK_PROMINENCE_SIGMA = 0.5
 # Below this ratio of robust sigma to the segment's own peak amplitude,
 # the trace carries no variation and there is nothing to detect. A constant
@@ -116,11 +122,36 @@ MIN_STRIDE_REGULARITY = 0.30
 # gait fundamental is not where `fs_hz` says it is, and the rate is the
 # prime suspect. Measured on this dataset: across all 48 trials at the
 # correct rate the out-of-band / in-band peak-power ratio never exceeds
-# 0.435 (the second harmonic is always weaker than the fundamental), while
-# claiming 100 Hz for 50 Hz data gives 15.1 and claiming 200 Hz gives 1002.
+# 0.476 (the second harmonic is always weaker than the fundamental), while
+# claiming 100 Hz for 50 Hz data gives 13.2 and claiming 200 Hz gives 647.
 # 1.0 sits in that empty gap and is also the natural physical boundary:
 # more power outside the human band than inside it.
 SAMPLE_RATE_OUT_OF_BAND_RATIO = 1.0
+# A single detected-step interval longer than this many step periods is a
+# hole in the running, not a detector miss: a walk break, a stop, or lost
+# signal. One missed step is a 2x interval and two consecutive misses ~3x
+# (the largest interval on any of the 48 trials is 3.4x, jog_16/sub_21,
+# and the next largest 2.2x) -- both are detector events that
+# `irregular_step_fraction` already reports. No runner stops stepping for
+# five periods (~1.8 s) while running, so 5x separates the two cleanly; a
+# 20 s stop is ~55x and a 60 s walk break ~165x. Without this the
+# whole-span cadence silently blends the hole in (a 60 s walk inside a 5 min
+# run reported 135 spm for a 168 spm runner) and the detector/spectral
+# disagreement it causes was blamed on the algorithm.
+DETECTION_GAP_STEP_PERIODS = 5.0
+# When the detected cadence is below the expected band AND doubling it would
+# land inside the band, the dominant spectral peak may be the STRIDE rate
+# (half the step rate) rather than the step rate -- a runner whose
+# stride-rate power exceeds step-rate power. Both estimators then halve
+# together and would otherwise "agree" that the runner is slow. Power at
+# twice the detected frequency at or above this fraction of the peak marks
+# the case as ambiguous rather than attributing it to the runner. On this
+# dataset stride/step power never exceeds 0.11, so it cannot fire here; it
+# exists for the placement where it can.
+HARMONIC_AMBIGUITY_MIN_RATIO = 0.25
+# Rolling window, in steps, for the smoothed cadence series. Must be EVEN --
+# see `cadence_series`.
+CADENCE_SMOOTH_STEPS = 6
 
 
 def steady_state_segment(
@@ -133,49 +164,61 @@ def steady_state_segment(
 
     Uses acceleration *magnitude*, which is rotation-invariant, so this runs
     before and independently of stage 2.
+
+    Returns the LONGEST active segment as `start`/`stop`, which is what the
+    single-bout trials here need. It also returns every active segment and
+    what fraction of the active time the longest one holds: on a 30 minute
+    run with a walk break at minute 10 the longest segment is the first ten
+    minutes, and the other two thirds of the run would otherwise vanish
+    with nothing but `trimmed_end_s` to show for it.
+
+    What this does NOT do: separate walking from running. The threshold is
+    on amplitude, and a walk at ~0.5 x the running RMS sits on the boundary.
+    A walk inside the segment shows up downstream as a detection gap (see
+    `cadence_summary`), not here.
+
+    Raises on non-finite input: a NaN anywhere poisons the median so no
+    window is "active" and the whole record was silently kept.
     """
     x = np.asarray(accel_magnitude, float)
+    if x.size and not np.all(np.isfinite(x)):
+        raise ValueError(
+            f"steady_state_segment: {int((~np.isfinite(x)).sum())} non-finite samples; "
+            f"reject or clean the record first"
+        )
     n = len(x)
     w = int(max(1, round(window_s * fs_hz)))
     k = n // w
+
+    def _whole(segmented: bool, n_windows: int) -> dict:
+        return {
+            "start": 0, "stop": n, "n_windows": n_windows, "segmented": segmented,
+            "trimmed_start_s": 0.0, "trimmed_end_s": 0.0, "kept_fraction": 1.0,
+            "segments": [(0, n)], "n_active_segments": 1,
+            "active_seconds": n / fs_hz, "kept_fraction_of_active": 1.0,
+        }
+
     if k < 3:
         # Too short to segment; take it whole and say so.
-        return {
-            "start": 0,
-            "stop": n,
-            "n_windows": k,
-            "segmented": False,
-            "trimmed_start_s": 0.0,
-            "trimmed_end_s": 0.0,
-            "kept_fraction": 1.0,
-        }
+        return _whole(False, k)
     rms = np.sqrt((x[: k * w].reshape(k, w) ** 2).mean(axis=1))
     active = rms >= rms_fraction * np.median(rms)
 
-    best_start = best_len = 0
+    segments: list[tuple[int, int]] = []
     i = 0
     while i < k:
         if active[i]:
             j = i
             while j < k and active[j]:
                 j += 1
-            if j - i > best_len:
-                best_start, best_len = i, j - i
+            segments.append((i * w, min(n, j * w)))
             i = j
         else:
             i += 1
-    if best_len == 0:
-        return {
-            "start": 0,
-            "stop": n,
-            "n_windows": k,
-            "segmented": False,
-            "trimmed_start_s": 0.0,
-            "trimmed_end_s": 0.0,
-            "kept_fraction": 1.0,
-        }
-    start = best_start * w
-    stop = min(n, (best_start + best_len) * w)
+    if not segments:
+        return _whole(False, k)
+    start, stop = max(segments, key=lambda seg: seg[1] - seg[0])
+    active_samples = sum(b - a for a, b in segments)
     return {
         "start": int(start),
         "stop": int(stop),
@@ -185,15 +228,20 @@ def steady_state_segment(
         "trimmed_end_s": float((n - stop) / fs_hz),
         "kept_fraction": float((stop - start) / n),
         "window_rms": rms,
+        "segments": segments,
+        "n_active_segments": len(segments),
+        "active_seconds": float(active_samples / fs_hz),
+        "kept_fraction_of_active": float((stop - start) / active_samples),
     }
 
 
 def estimate_step_frequency(a_vert: np.ndarray, fs_hz: float) -> dict:
-    """Independent, detector-free estimate of step rate from the spectrum.
+    """Detector-free estimate of step rate from the spectrum.
 
-    Kept separate from peak detection precisely so it can be used to *audit*
-    peak detection: two estimators that share no machinery disagreeing is
-    evidence, whereas a detector agreeing with itself is not.
+    Used to audit peak detection -- with the caveat spelled out in
+    `diagnose_cadence`: the detector's band is centred on this estimate, so
+    the two are coupled, and their agreement bounds within-band miscounting
+    only.
     """
     pk = dsp.spectral_peak(a_vert, fs_hz)
     return {
@@ -341,7 +389,7 @@ def detect_steps(
 
 
 def cadence_series(
-    step_times_s: np.ndarray, smooth_steps: int = 6
+    step_times_s: np.ndarray, smooth_steps: int = CADENCE_SMOOTH_STEPS
 ) -> pd.DataFrame:
     """Instantaneous and smoothed cadence, in steps per minute.
 
@@ -401,6 +449,8 @@ def cadence_summary(
             "cadence_cv": np.nan,
             "irregular_step_fraction": np.nan,
             "alternating_interval_asymmetry_abs_pct": np.nan,
+            "largest_interval_step_periods": np.nan,
+            "detection_gap": False,
             "span_s": span_now,
             "span_too_short": bool(span_now < min_span_s),
         }
@@ -416,6 +466,10 @@ def cadence_summary(
     # normal stride-to-stride variability (a few percent) and well inside
     # those two failure modes.
     irregular = float(np.mean(np.abs(intervals - med) > 0.25 * med))
+    # The longest interval, in step periods. One interval many periods long
+    # is a hole in the running -- the whole-span cadence above still counts
+    # the hole's duration in `span`, so it must be flagged, not averaged in.
+    largest = float(intervals.max() / med)
 
     # Alternating-interval asymmetry: the difference between the two
     # interleaved sets of step intervals, as a percentage of the mean
@@ -452,6 +506,8 @@ def cadence_summary(
         "cadence_cv": float(np.std(intervals) / np.mean(intervals)),
         "irregular_step_fraction": irregular,
         "alternating_interval_asymmetry_abs_pct": asym,
+        "largest_interval_step_periods": largest,
+        "detection_gap": bool(largest > DETECTION_GAP_STEP_PERIODS),
         "span_s": span,
         "span_too_short": False,
     }
@@ -465,29 +521,37 @@ def diagnose_cadence(
     expected: tuple[float, float] = EXPECTED_CADENCE_SPM,
     sample_rate_plausible: bool = True,
     out_of_band_peak_hz: float | None = None,
+    detection_gap: bool = False,
+    largest_interval_step_periods: float = np.nan,
+    second_harmonic_ratio: float = np.nan,
 ) -> dict:
     """Flag out-of-band cadence and attribute the cause.
 
-    Four outcomes: "none", "sample_rate", "algorithm", "trial".
+    Outcomes: "none", "sample_rate", "trial", "ambiguous", "algorithm".
 
-    The algorithm-vs-trial attribution rests on having two estimators that
-    share no machinery: peak counting and the spectral peak. If they agree,
-    the detector is doing its job and an out-of-band number is a fact about
-    the trial. If they disagree, the detector is at fault -- and the ratio
-    between them says how.
+    What the detector-vs-spectrum comparison can and cannot show
+    ----------------------------------------------------------------
+    The detector is NOT independent of the spectral estimate: its band-pass
+    is [0.7, 1.5] x the spectral f_step and its minimum peak spacing is 0.6
+    of that period, so it can only ever count peaks near the spectral rate.
+    Band-limited noise with no steps in it passes the 10% agreement test on
+    23 of 30 runs. Agreement therefore rules out *within-band* miscounting
+    (missed or doubled steps that survive the filter) and nothing more; it
+    is a consistency check, not independent confirmation. The half/double
+    branches below are defensive: with the shipped band the ratio stays
+    within 0.86-1.11 even on noise, and 0.96-1.04 on the 48 real trials.
 
-    That reasoning has one precondition, which is why `sample_rate_plausible`
-    is checked *first*: the two estimators share the sample rate. Given a
-    wrong `fs_hz` they agree with each other while both being wrong
-    together, and their agreement was previously read as evidence about the
-    runner -- reporting a rate error as "the runner's cadence really is
-    outside 150-190 spm". Agreement under a shared wrong assumption is not
-    evidence. Pass the verdict from `check_sample_rate` to keep that
-    distinction.
+    Three cases where the two estimators agree while both are wrong are
+    handled explicitly, in order: a wrong `fs_hz` (both rescale together);
+    a hole in the detected steps (the whole-span cadence blends it in while
+    the spectrum ignores it -- caught by `detection_gap`); and a spectral
+    peak sitting on the stride subharmonic (both halve together -- caught by
+    `second_harmonic_ratio` when doubling the cadence would land in band).
     """
     in_band = bool(expected[0] <= detected_spm <= expected[1])
-    ratio = detected_spm / spectral_spm if spectral_spm > 0 else np.nan
-    agree = bool(abs(ratio - 1.0) <= DETECTOR_SPECTRAL_TOLERANCE)
+    spectral_ok = bool(np.isfinite(spectral_spm) and spectral_spm > 0)
+    ratio = detected_spm / spectral_spm if spectral_ok else np.nan
+    agree = bool(np.isfinite(ratio) and abs(ratio - 1.0) <= DETECTOR_SPECTRAL_TOLERANCE)
 
     if not sample_rate_plausible:
         cause = "sample_rate"
@@ -506,11 +570,35 @@ def diagnose_cadence(
             "no defensible cadence: fewer than three steps, or a step span "
             f"shorter than {MIN_STEADY_SECONDS:g}s"
         )
+    elif not spectral_ok:
+        cause = "trial"
+        detail = "no spectral estimate to audit the detector against"
     elif stride_regularity < MIN_STRIDE_REGULARITY:
         cause = "trial"
         detail = (
             f"stride regularity {stride_regularity:.2f} < {MIN_STRIDE_REGULARITY}: "
             f"this segment is not steady running, so no cadence is defensible"
+        )
+    elif detection_gap:
+        cause = "trial"
+        detail = (
+            f"steps stop for {largest_interval_step_periods:.0f} step periods inside the "
+            f"segment: not continuous running (walk break, stop, or lost signal), so the "
+            f"whole-span cadence is not a running cadence"
+        )
+    elif (
+        not in_band
+        and detected_spm < expected[0]
+        and 2.0 * detected_spm <= expected[1]
+        and np.isfinite(second_harmonic_ratio)
+        and second_harmonic_ratio >= HARMONIC_AMBIGUITY_MIN_RATIO
+    ):
+        cause = "ambiguous"
+        detail = (
+            f"the dominant spectral peak may be the stride rate, not the step rate: power at "
+            f"twice the detected frequency is {second_harmonic_ratio:.2f} of the peak and "
+            f"{2 * detected_spm:.0f} spm is a plausible cadence. Both estimators would halve "
+            f"together; cannot be resolved from the spectrum alone"
         )
     elif abs(ratio - 0.5) <= HARMONIC_ERROR_TOLERANCE:
         cause = "algorithm"
@@ -534,7 +622,7 @@ def diagnose_cadence(
     elif not in_band:
         cause = "trial"
         detail = (
-            f"detector agrees with the independent spectral estimate "
+            f"detector agrees with the spectral estimate "
             f"({spectral_spm:.0f} spm) to {100 * abs(ratio - 1):.0f}%; the runner's "
             f"cadence really is outside {expected[0]:.0f}-{expected[1]:.0f} spm"
         )
@@ -547,8 +635,9 @@ def diagnose_cadence(
         "detector_spectral_ratio": float(ratio),
         "detector_agrees_with_spectrum": agree,
         "sample_rate_plausible": bool(sample_rate_plausible),
-        # "none" | "sample_rate" | "algorithm" | "trial"
+        "detection_gap": bool(detection_gap),
+        # "none" | "sample_rate" | "trial" | "ambiguous" | "algorithm"
         "failure_attributed_to": cause,
         "diagnosis": detail,
-        "flagged": bool(not in_band or not agree or not sample_rate_plausible),
+        "flagged": bool(cause != "none"),
     }
