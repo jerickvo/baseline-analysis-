@@ -62,6 +62,25 @@ SUBJECT_INFO_FILENAME = "data_subjects_info.csv"
 FLATLINE_SECONDS = 0.1
 
 
+# CoreMotion's `userAcceleration` is the NEGATIVE of the kinematic
+# acceleration, in g. Apple's accelerometer convention reports the specific
+# force with the sign that makes a device at rest read its own `gravity`
+# vector -- (0, 0, -1) lying face up -- and a device in free fall read 0.
+# `userAcceleration` is defined as that reading minus `gravity`, so in free
+# fall, when the body is accelerating at 1 g TOWARD the earth, it equals
+# -gravity and points AWAY from the earth. Every stage here reasons in
+# kinematic polarity (positive = accelerating away from the earth: the
+# stance-phase push, the footstrike deceleration), so the sign is converted
+# once, at this boundary, and `Trial.df` keeps the file's own values.
+#
+# Verified on MotionSense rather than taken from documentation: at samples
+# where |userAcceleration + gravity| < 0.25 g -- the hardware reading near
+# zero, i.e. the flight phase -- the uncorrected vertical component read
+# +0.99 g on 48 of 48 jog trials, where physics requires -1 g. The same
+# API writes the logger's motion.csv, so the same conversion applies there.
+USER_ACCEL_KINEMATIC_SIGN = -1.0
+
+
 # --- identifiers and containers ------------------------------------------
 
 
@@ -114,13 +133,27 @@ class Trial:
 
     @property
     def duration_s(self) -> float:
-        """Duration implied by sample count and rate.
+        """Duration of the record.
 
-        Note this is *derived*, not measured: with no timestamps in the file
-        we cannot distinguish a 97.2 s trial from a 100 s trial that dropped
-        140 samples.
+        Measured from the hardware timestamps when the record has them (a
+        logger session), otherwise *derived* from sample count and rate:
+        with no timestamps in the file we cannot distinguish a 97.2 s trial
+        from a 100 s trial that dropped 140 samples.
         """
+        if "t_hw" in self.df.columns and self.n_samples > 1:
+            t_hw = self.df["t_hw"].to_numpy(float)
+            return float(t_hw[-1] - t_hw[0])
         return self.n_samples / self.fs_hz
+
+    @property
+    def sample_times_s(self) -> np.ndarray | None:
+        """Per-sample hardware times on the app's origin, or None.
+
+        Stage 3 timestamps detected steps from this when it exists, so a
+        dropped sample cannot shift every later step time by one period."""
+        if "t_hw" in self.df.columns:
+            return self.df["t_hw"].to_numpy(float)
+        return None
 
     @property
     def t(self) -> np.ndarray:
@@ -132,6 +165,17 @@ class Trial:
 
     @property
     def user_accel(self) -> np.ndarray:
+        """User acceleration in the sensor frame, in **kinematic** polarity.
+
+        `df` keeps the columns exactly as CoreMotion recorded them; this
+        view negates them. See `USER_ACCEL_KINEMATIC_SIGN` for why.
+        """
+        return USER_ACCEL_KINEMATIC_SIGN * self.df[USER_ACCEL_COLUMNS].to_numpy(float)
+
+    @property
+    def user_accel_as_recorded(self) -> np.ndarray:
+        """The same columns in CoreMotion's own sign, for anyone comparing
+        against the file. Nothing in the pipeline uses this."""
         return self.df[USER_ACCEL_COLUMNS].to_numpy(float)
 
     @property
@@ -408,8 +452,12 @@ def summarize_trials(
 #
 #     <folder>/motion.csv      t,ax,ay,az,gx,gy,gz,rx,ry,rz,qw,qx,qy,qz
 #     <folder>/accel_raw.csv   t,ax,ay,az            (200 Hz raw, gravity in)
-#     <folder>/gps.csv         t,latitude,longitude,speed,horizontalAccuracy,altitude
-#     <folder>/session.json    counts, achieved rates, gap statistics, markers
+#     <folder>/gps.csv         t,latitude,longitude,speed,horizontalAccuracy,
+#                              altitude,speedAccuracy,verticalAccuracy
+#                              (six columns in files from before the two
+#                              accuracy columns existed; loaded by name)
+#     <folder>/session.json    counts, achieved rates, gap and drop statistics,
+#                              rows lost to disk, markers
 #
 # Unlike MotionSense, `t` is a REAL per-sample hardware timestamp (seconds
 # since session start on the monotonic clock), so sampling irregularities
@@ -422,6 +470,12 @@ LOGGER_ACCEL_FILENAME = "accel_raw.csv"
 LOGGER_GPS_FILENAME = "gps.csv"
 SESSION_JSON_FILENAME = "session.json"
 LOGGER_TIME_COLUMN = "t"
+# gps.csv header as SessionRecorder.swift writes it today. The test fixture
+# imports this so the Python side cannot drift from what it claims to read.
+LOGGER_GPS_COLUMNS = [
+    "t", "latitude", "longitude", "speed", "horizontalAccuracy", "altitude",
+    "speedAccuracy", "verticalAccuracy",
+]
 LOGGER_MOTION_COLUMNS = [
     "t", "ax", "ay", "az", "gx", "gy", "gz", "rx", "ry", "rz", "qw", "qx", "qy", "qz",
 ]
@@ -431,9 +485,35 @@ LOGGER_TO_DEVICE_MOTION = {
     "rx": "rotationRate.x", "ry": "rotationRate.y", "rz": "rotationRate.z",
 }
 # A sample interval more than this multiple of the measured median interval
-# is a gap. Identical to the app's GapTracker rule, so the two agree on what
-# a gap is; the loader also recomputes it rather than trusting session.json.
+# is a gap. The same multiple as the app's GapTracker, so the two agree on
+# what a gap is on a steady stream (tests/test_gaptracker_port.py checks
+# that on single drops). They are not the same algorithm: the app measures
+# its median over a sliding 128-delta window, this loader over the whole
+# record, so across a mid-session change in delivered rate the two counts
+# differ (the app reports the 65-128 deltas until it recalibrates, this
+# loader every delta of the slower section), and the loader's is the one
+# any analysis decision uses.
 GAP_INTERVAL_MULTIPLE = 3.0
+# GPS fixes coarser than this (median horizontalAccuracy, metres) are
+# flagged. A phone with Precise Location on reports 5-10 m in the open;
+# with it off, CoreLocation reports fixes in the thousands of metres with a
+# positive accuracy that passes every sign test. 20 m is the coarsest fix a
+# pace-per-kilometre model could still use.
+GPS_COARSE_ACCURACY_M = 20.0
+# session.json fields the loader carries into the integrity record, with
+# the integrity key they land under. Absent in files from before the field
+# existed, in which case the value is None.
+SESSION_JSON_INTEGRITY_FIELDS = {
+    "motionSampleCount": "metadata_sample_count",
+    "motionGapCount": "metadata_gap_count",
+    "accelGapCount": "metadata_accel_gap_count",
+    "largestGapSeconds": "metadata_largest_gap_s",
+    "motionDroppedSampleEstimate": "metadata_dropped_estimate",
+    "motionNonMonotonicCount": "metadata_nonmonotonic",
+    "csvRowsLost": "metadata_rows_lost",
+    "gpsStaleFixesSkipped": "metadata_gps_stale_skipped",
+    "achievedMotionHz": "metadata_achieved_hz",
+}
 # A gap is not the only way to lose samples. One dropped sample makes a 2x
 # interval and two make exactly 3x: the gap rule never counts either, so a
 # stream can read "no gaps" while shedding a sample every few seconds. Any
@@ -479,6 +559,15 @@ def check_timestamps(t: np.ndarray, gap_multiple: float = GAP_INTERVAL_MULTIPLE)
     """
     t = np.asarray(t, float)
     n = len(t)
+    if n and not np.all(np.isfinite(t)):
+        # A NaN timestamp makes two NaN deltas, which every comparison
+        # below silently excludes: the gap, drop and monotonicity counts
+        # would all pass and the session would load as clean.
+        n_bad = int((~np.isfinite(t)).sum())
+        raise ValueError(
+            f"{n_bad} non-finite timestamp(s) of {n}: the sample clock is broken, "
+            f"no rate or gap can be measured"
+        )
     if n < 2:
         return {
             "n_samples": n, "measured_fs_hz": np.nan, "median_interval_s": np.nan,
@@ -527,17 +616,29 @@ def load_logger_gps(folder: str | Path) -> tuple[pd.DataFrame, dict]:
     """gps.csv with the rows no analysis should see removed, and a count of them.
 
     CoreLocation commonly delivers a *cached* last-known fix first, stamped
-    minutes or hours before the session started; the logger writes it as is,
-    with a large negative `t`. Speed is -1 when CoreLocation could not
-    compute it and horizontalAccuracy is negative when the fix is invalid.
-    All three are dropped here, and counted, rather than silently entering a
-    pace estimate.
+    minutes or hours before the session started. The app now skips those
+    (and counts them as `gpsStaleFixesSkipped`); files written before it did
+    carry them with a large negative `t`, so the filter stays. Speed is -1
+    when CoreLocation could not compute it and horizontalAccuracy is
+    negative when the fix is invalid. All are dropped here, and counted,
+    rather than silently entering a pace estimate.
+
+    A fix can also be *valid and coarse*: with Precise Location off the
+    accuracy is positive and enormous. The median and 95th-percentile
+    horizontalAccuracy of the kept fixes are reported so the quality gate
+    can say so (`GPS_COARSE_ACCURACY_M`).
     """
+    empty = {
+        "gps_rows": 0, "gps_dropped_stale": 0, "gps_dropped_invalid": 0, "gps_kept": 0,
+        "gps_accuracy_median_m": np.nan, "gps_accuracy_p95_m": np.nan,
+    }
     path = Path(folder) / LOGGER_GPS_FILENAME
     if not path.is_file():
-        return pd.DataFrame(), {"gps_rows": 0, "gps_dropped_stale": 0, "gps_dropped_invalid": 0}
+        return pd.DataFrame(), empty
     g = pd.read_csv(path)
     n0 = len(g)
+    if n0 == 0:
+        return g, empty
     stale = g["t"] < 0
     invalid = (g["speed"] < 0) | (g["horizontalAccuracy"] < 0)
     # Newer sessions carry speedAccuracy / verticalAccuracy (negative when
@@ -545,11 +646,14 @@ def load_logger_gps(folder: str | Path) -> tuple[pd.DataFrame, dict]:
     if "speedAccuracy" in g.columns:
         invalid |= g["speedAccuracy"] < 0
     kept = g[~stale & ~invalid].reset_index(drop=True)
+    acc = kept["horizontalAccuracy"].to_numpy(float) if len(kept) else np.empty(0)
     return kept, {
         "gps_rows": int(n0),
         "gps_dropped_stale": int(stale.sum()),
         "gps_dropped_invalid": int((invalid & ~stale).sum()),
         "gps_kept": int(len(kept)),
+        "gps_accuracy_median_m": float(np.median(acc)) if acc.size else np.nan,
+        "gps_accuracy_p95_m": float(np.percentile(acc, 95)) if acc.size else np.nan,
     }
 
 
@@ -634,7 +738,15 @@ def load_logger_session(
     for src, dst in LOGGER_TO_DEVICE_MOTION.items():
         df[dst] = raw[src].to_numpy(float)
     df = df[DEVICE_MOTION_COLUMNS].copy()
-    df["t_hw"] = t_hw - t_hw[0]
+    # Hardware timestamps stay on the APP's origin (session start), not on
+    # the first sample: the first CMDeviceMotion sample arrives some hundred
+    # milliseconds after Start, and the app's event markers and gps.csv are
+    # on that origin. Re-zeroing here shifted every derived time off the
+    # marker and GPS timeline by an amount that was then thrown away -- and
+    # by minutes, under on_gap="longest", when a later piece won. The
+    # uniform index `t_s` still starts at 0 for the kept record; the offset
+    # between the two is `integrity["t_start_s"]`.
+    df["t_hw"] = t_hw
 
     # File-level checks reuse the MotionSense machinery, then the timestamp
     # facts replace the "not measurable" placeholders it writes.
@@ -642,6 +754,9 @@ def load_logger_session(
     integrity.update({
         "has_timestamp_column": True,
         "timestamp_irregularities_detectable": True,
+        # Hardware time of the first kept sample on the app's origin: add it
+        # to `t_s` to land on the marker / gps.csv timeline.
+        "t_start_s": float(t_hw[0]),
         "measured_fs_hz": fs_hz,
         "jitter_ms": ts["jitter_ms"],
         "n_gaps": ts["n_gaps"],
@@ -654,13 +769,22 @@ def load_logger_session(
     })
     if metadata is not None:
         # Cross-check the app's own bookkeeping against the file it wrote.
+        for src_key, dst_key in SESSION_JSON_INTEGRITY_FIELDS.items():
+            integrity[dst_key] = metadata.get(src_key)
         n_meta = metadata.get("motionSampleCount")
-        integrity["metadata_sample_count"] = n_meta
         integrity["metadata_count_matches"] = (int(n_meta) == n_rows_written) if n_meta is not None else None
-        integrity["metadata_gap_count"] = metadata.get("motionGapCount")
         integrity["metadata_in_progress"] = bool(metadata.get("inProgress", False))
-        integrity["metadata_achieved_hz"] = metadata.get("achievedMotionHz")
+        integrity["metadata_event_markers"] = metadata.get("eventMarkers") or []
     problems = [p for p in [integrity["problems"]] if p]
+    if metadata is not None:
+        rows_lost = integrity.get("metadata_rows_lost") or 0
+        if rows_lost:
+            problems.append(f"app reports {rows_lost} row(s) never reached disk")
+        if integrity.get("metadata_count_matches") is False:
+            problems.append(
+                f"app counted {integrity['metadata_sample_count']} motion samples, file holds "
+                f"{n_rows_written}"
+            )
     if ts["n_gaps"]:
         problems.append(f"{ts['n_gaps']} gap(s)")
     if discarded_for_gaps > 0:

@@ -35,6 +35,8 @@ def synthetic_anatomical(
     seconds: float = DURATION_S,
     f_step_hz: float = F_STEP_HZ,
     seed: int = 0,
+    step_interval_cv: float = 0.0,
+    amplitude: float = 1.0,
 ) -> dict:
     """Body-frame signals a lower-back sensor would see, plus their truth.
 
@@ -43,15 +45,30 @@ def synthetic_anatomical(
     falls -- fore-aft leads vertical by about a quarter cycle. Mediolateral
     sway is at the stride rate, half the step rate. Angular velocity about
     vertical alternates sign every step.
+
+    Signals are kinematic: positive vertical is away from the earth.
+
+    `step_interval_cv` jitters the step-to-step interval (real runners sit
+    at a few percent). With jitter every channel is a function of gait
+    PHASE, so the whole signal stays locked to the steps the way a real
+    one is.
     """
     rng = np.random.default_rng(seed)
     n = int(seconds * fs_hz)
     t = np.arange(n) / fs_hz
-    w = 2 * np.pi * f_step_hz
-    a_vert = 1.2 * np.sin(w * t) + 0.3 * np.sin(2 * w * t) + 0.05 * rng.normal(size=n)
-    a_fwd = -0.5 * np.sin(w * t + 1.0) + 0.05 * rng.normal(size=n)
-    a_ml = 0.2 * np.sin(w * t / 2) + 0.05 * rng.normal(size=n)
-    omega_v = 1.5 * np.sin(w * t / 2) + 0.05 * rng.normal(size=n)
+    if step_interval_cv > 0:
+        n_iv = int(seconds * f_step_hz * 1.5) + 4
+        iv = (1.0 / f_step_hz) * (1.0 + step_interval_cv * rng.normal(size=n_iv))
+        iv = np.clip(iv, 0.5 / f_step_hz, 1.5 / f_step_hz)
+        step_times = np.concatenate([[0.0], np.cumsum(iv)])
+        phase = np.interp(t, step_times, np.arange(len(step_times), dtype=float))
+        w_t = 2 * np.pi * phase  # gait phase in radians, one step = 2 pi
+    else:
+        w_t = 2 * np.pi * f_step_hz * t
+    a_vert = amplitude * (1.2 * np.sin(w_t) + 0.3 * np.sin(2 * w_t)) + 0.05 * rng.normal(size=n)
+    a_fwd = amplitude * (-0.5 * np.sin(w_t + 1.0)) + 0.05 * rng.normal(size=n)
+    a_ml = amplitude * 0.2 * np.sin(w_t / 2) + 0.05 * rng.normal(size=n)
+    omega_v = amplitude * 1.5 * np.sin(w_t / 2) + 0.05 * rng.normal(size=n)
     return {
         "t": t,
         "accel": np.c_[a_fwd, a_ml, a_vert],  # columns: forward, ML (left), up
@@ -72,6 +89,8 @@ def write_logger_session(
     gap_len_s: float = 0.0,
     stale_gps_fix: bool = True,
     seed: int = 1,
+    gps_accuracy_m: float = 5.0,
+    event_markers: list | None = None,
 ) -> Path:
     """Rotate the anatomical signals into an arbitrary device frame and
     write motion.csv / accel_raw.csv / gps.csv / session.json exactly as
@@ -88,7 +107,11 @@ def write_logger_session(
     t = np.maximum.accumulate(t)  # hardware clocks do not run backwards
     if gap_at_s is not None:
         t[t >= gap_at_s] += gap_len_s
-    dev_a = anat["accel"] @ R.T
+    # CoreMotion writes userAcceleration as the NEGATIVE of the kinematic
+    # acceleration (see loader.USER_ACCEL_KINEMATIC_SIGN); the synthetic
+    # signals are kinematic, so the file gets their negation, exactly as
+    # the phone would have written it.
+    dev_a = (loader.USER_ACCEL_KINEMATIC_SIGN * anat["accel"]) @ R.T
     dev_g = anat["gravity"] @ R.T
     dev_w = anat["gyro"] @ R.T
     folder.mkdir(parents=True, exist_ok=True)
@@ -100,21 +123,33 @@ def write_logger_session(
     with open(folder / "accel_raw.csv", "w") as f:
         f.write("t,ax,ay,az\n")
     with open(folder / "gps.csv", "w") as f:
-        f.write("t,latitude,longitude,speed,horizontalAccuracy,altitude\n")
+        # The header is the loader's own constant, so this fixture and the
+        # loader cannot drift apart; SessionRecorder.swift writes the same
+        # eight columns, at %.6f/%.6f/%.6f/%.3f/%.2f/%.2f/%.3f/%.2f.
+        f.write(",".join(loader.LOGGER_GPS_COLUMNS) + "\n")
         if stale_gps_fix:
-            # CoreLocation's cached last-known fix, stamped before the session.
-            f.write("-812.301000,37.42000000,-122.08000000,-1.000,65.00,10.00\n")
+            # CoreLocation's cached last-known fix, stamped before the
+            # session. The app now skips these; files from before it did
+            # carry them, so the loader must still drop them.
+            f.write("-812.301000,37.420000,-122.080000,-1.000,65.00,10.00,-1.000,8.00\n")
         for k in range(int(anat["t"][-1])):
-            f.write("%.6f,%.8f,%.8f,%.3f,%.2f,%.2f\n" % (k, 37.42 + k * 1e-5, -122.08, 3.3, 5.0, 10.0))
+            f.write("%.6f,%.6f,%.6f,%.3f,%.2f,%.2f,%.3f,%.2f\n" % (
+                k, 37.42 + k * 1e-5, -122.08, 3.3, gps_accuracy_m, 10.0, 0.3, 4.0))
     meta = {
         "id": "synthetic", "label": "synthetic 3mi",
         "startTime": "2026-09-03T12:00:00Z", "endTime": "2026-09-03T12:01:30Z",
         "durationSeconds": float(t[-1] - t[0]),
-        "motionSampleCount": n, "accelSampleCount": 0, "gpsSampleCount": int(anat["t"][-1]) + int(stale_gps_fix),
+        "motionSampleCount": n, "accelSampleCount": 0, "gpsSampleCount": int(anat["t"][-1]),
         "achievedMotionHz": n / float(t[-1] - t[0]), "achievedAccelHz": 0.0,
         "deviceModel": "synthetic", "iosVersion": "16.0",
         "motionGapCount": int(gap_at_s is not None), "accelGapCount": 0,
-        "largestGapSeconds": float(gap_len_s), "eventMarkers": [], "inProgress": False,
+        "largestGapSeconds": float(gap_len_s), "eventMarkers": list(event_markers or []),
+        "inProgress": False,
+        # Post-audit integrity counters, as SessionRecorder.metadataSnapshot
+        # writes them.
+        "motionDroppedSampleEstimate": 0, "accelDroppedSampleEstimate": 0,
+        "motionNonMonotonicCount": 0, "accelNonMonotonicCount": 0,
+        "csvRowsLost": 0, "gpsStaleFixesSkipped": int(stale_gps_fix),
     }
     with open(folder / "session.json", "w") as f:
         json.dump(meta, f, indent=1)
@@ -265,8 +300,12 @@ def test_frame_recovers_the_true_axes_from_any_placement(name, R):
     frame = orientation.build_frame(a, g, FS_HZ)
     assert dsp.angle_between_deg(frame.up, R @ anat["up"]) < 0.5, name
     assert dsp.axis_angle_deg(frame.forward, R @ anat["forward"]) < 3.0, name
-    assert frame.diagnostics["forward_sign_criteria_agree"], name
+    # Confidence comes from the phase criterion alone. The impact
+    # statistic samples fore-aft at its own zero crossing on a
+    # centre-of-mass signal, so its sign is set by noise and rotation
+    # residuals and its agreement is a coin flip: deliberately NOT asserted.
     assert frame.diagnostics["forward_sign_confident"], name
+    assert abs(frame.diagnostics["forward_phase_effect_size"]) > 0.5, name
     assert dsp.angle_between_deg(frame.forward, R @ anat["forward"]) < 3.0, (
         f"{name}: forward sign resolved backwards"
     )
@@ -371,8 +410,13 @@ def test_quality_is_insufficient_for_an_unfinished_session(tmp_path):
     assert any("in-progress" in b for b in result["quality"]["blockers"])
 
 
-def test_quality_is_partial_for_a_fragmented_run(tmp_path):
-    """Two bouts separated by a stop: analysed, but flagged as a fraction."""
+def test_a_run_split_by_a_stop_is_pooled_not_halved(tmp_path):
+    """Two bouts separated by a stop: both analysed, cadence pooled over both.
+
+    FIXED: only the longest bout used to be analysed, so a single mid-run
+    stop dropped 40% of this run from the summary (and 41-50% of a real
+    30-minute run with one traffic light).
+    """
     a = synthetic_anatomical(seconds=60.0, seed=0)
     b = synthetic_anatomical(seconds=40.0, seed=1)
     n_still = int(20 * FS_HZ)
@@ -391,10 +435,18 @@ def test_quality_is_partial_for_a_fragmented_run(tmp_path):
     folder = write_logger_session(tmp_path / "fragmented", joined, np.eye(3))
     result = pipeline.run_session(folder)
     q = result["quality"]
-    assert q["verdict"] == "partial", q["summary"]
-    assert any("fragmented" in c for c in q["caveats"]), q["caveats"]
+    assert q["verdict"] == "ok", q["summary"]
     assert result["segment"]["n_segments"] == 2
     assert 38.0 < result["segment"]["discarded_steady_s"] < 42.0
+    pooled = result["cadence_summary_all_bouts"]
+    assert pooled["n_bouts_analysed"] == 2
+    assert 98.0 < pooled["steady_s_all_bouts"] < 102.0
+    assert abs(pooled["cadence_spm"] - a["cadence_spm"]) < 1.0
+    # Both bouts' steps are in the pooled count, not just the longest bout's.
+    assert pooled["n_steps"] > 0.95 * (60 + 40) * F_STEP_HZ
+    row = pipeline.flatten(result)
+    assert row["cadence_spm"] == pooled["cadence_spm"]
+    assert row["n_bouts_analysed"] == 2
 
 
 def test_quality_is_insufficient_when_the_rate_is_lied_about(tmp_path):
@@ -415,10 +467,10 @@ def test_side_classification_is_never_a_gate(tmp_path):
     anat = synthetic_anatomical()
     folder = write_logger_session(tmp_path / "side", anat, np.eye(3))
     q = pipeline.run_session(folder)["quality"]
-    # A stride-rate sinusoid alternates by construction, and so does its
-    # surrogate: no information beyond the spectrum, so "unreliable" is the
-    # honest label -- and it must not have blocked the run.
-    assert q["side_classification"] == "unreliable"
+    # There is no side verdict, on this or any record: alternation is
+    # gait-locked by construction (see `lateral`), so nothing signal-only
+    # can turn it into left/right -- and it must not have blocked the run.
+    assert q["side_classification"].startswith("not classifiable")
     assert q["verdict"] == "ok"
 
 

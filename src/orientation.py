@@ -19,6 +19,16 @@ Sign conventions
 earth (a device lying flat, screen up, reports (0, 0, -1)), so up = -g_hat.
 `mediolateral = up x forward`, which for a right-handed triad points to the
 runner's **left**.
+
+Polarity of the projected components: every function here that projects
+`user_accel` returns kinematic polarity -- positive vertical is the body
+accelerating away from the earth -- **provided the input is kinematic**.
+`loader.Trial.user_accel` delivers that; CoreMotion's raw
+`userAcceleration` is the negative of it (see
+`loader.USER_ACCEL_KINEMATIC_SIGN`). Feeding the raw columns in inverts
+every polarity-dependent quantity while leaving cadence, spectra and axes
+untouched, which is how that inversion went unnoticed until the free-fall
+test in the loader caught it.
 """
 
 from __future__ import annotations
@@ -55,6 +65,24 @@ HARMONIC_REL_BW = 0.10
 # +/- 0.5 * atan(2 / (4 - 1)) ~ 17 deg by the eigenvalue spread alone;
 # below that the "dominant" axis is not meaningfully dominant.
 FORWARD_CONDITIONING_MIN_RATIO = 4.0
+
+# The forward sign is called confident when the phase criterion's
+# correlation is at least this strong. 0.1 is the level below which a
+# correlation between two band-limited gait channels is indistinguishable
+# from a chance alignment over a 20-90 s record; on the pocket data the
+# criterion's median |statistic| is 0.20, on centre-of-mass synthetics it
+# is > 0.9, so 0.1 separates "weak but present" from "noise".
+FORWARD_SIGN_MIN_EFFECT = 0.1
+
+# Low edge of the band the periodicity check autocorrelates, as a multiple
+# of the step frequency. The stride subharmonic at 0.5 x f_step carries the
+# left/right asymmetry that the symmetry index exists to measure. A 4th-
+# order Butterworth run forward and backward has |H|^2 = 0.50 at its
+# cutoff, so a cutoff AT 0.5 x f_step threw away half of that power and
+# inflated the index (a synthetic with a 0.8-amplitude subharmonic read
+# 0.74 instead of 0.22). At 0.25 x f_step the subharmonic passes with
+# |H|^2 > 0.99 while drift below it is still removed.
+SYMMETRY_BAND_LOW_MULTIPLE = 0.25
 
 # Periodicity acceptance thresholds for the resolved vertical acceleration.
 # The test is applied at the *stride* lag (two step periods), which is the
@@ -277,35 +305,41 @@ def resolve_forward_sign(
 ) -> dict:
     """Fix the 180-degree ambiguity of the forward axis.
 
-    Two criteria are evaluated and the sign is called confident only when
-    they agree. Both rest on the same biomechanics of a stance phase: the
-    ground reaction force brakes the runner early in stance and propels
-    them late in stance, while vertical acceleration rises through early
-    stance and falls through late stance.
+    One criterion decides, one is reported. Both rest on the biomechanics
+    of a stance phase: the ground reaction force brakes the runner early in
+    stance and propels them late in stance, while vertical acceleration
+    rises through early stance and falls through late stance.
 
-    ``phase`` (primary)
+    ``phase`` (decides the sign and the confidence)
         Braking coincides with *rising* vertical acceleration, propulsion
         with *falling*, so fore-aft acceleration is anti-correlated with the
         time derivative of vertical acceleration: pick the sign that makes
         corr(a_fwd, d a_vert/dt) negative. This holds at the centre of mass
         -- the lower back, where the product will run -- because there the
         vertical peak is midstance, the moment fore-aft force crosses zero.
+        It is invariant to the polarity of the input (both channels flip
+        together), and on synthetic centre-of-mass signals it recovers the
+        true forward direction to < 1 deg under every rotation tried.
 
-    ``impact`` (cross-check, the original criterion)
+    ``impact`` (reported only; it does NOT gate confidence)
         Fore-aft acceleration should be negative *at* the vertical peak.
-        Valid where the peak is early stance (a thigh-worn sensor), but at
-        the centre of mass it samples the zero crossing and is
-        ill-conditioned by construction.
+        That is valid where the peak is early stance, and at the centre of
+        mass -- where the peak is midstance -- it samples fore-aft at its
+        own zero crossing. Measured: on centre-of-mass synthetics its
+        statistic is within +/-0.012 under 16 rotations, i.e. its sign is
+        noise; on the pocket data it comes out negative on 24 of 48 trials,
+        a coin flip. Gating confidence on agreement with a null statistic
+        made "confident" unreachable at the production placement and turned
+        a correct phase answer into "criteria disagree" at random, which is
+        why the gate was removed.
 
-    Measured on the pocket dataset the two criteria have equal effect size
-    (median |stat| 0.20 and 0.19) and equal split-half consistency, yet
-    **disagree on the sign in 18 of 48 trials**. Requiring both to agree
-    drops the confident count from 35/48 to 18/48, which is the honest
-    number. Internal consistency was never evidence of correctness --
-    that is why agreement between two independent criteria is now the
-    confidence test. Nothing in stages 3 or 4 depends on the result: it
-    sets plot polarity and the left/right naming of the mediolateral axis,
-    not any number computed.
+    Confidence therefore means: the phase correlation is at least
+    `FORWARD_SIGN_MIN_EFFECT` in magnitude and has the same sign on both
+    halves of the record. On centre-of-mass data that is a validated
+    criterion; on thigh-pocket data it is an inference from the same
+    stance mechanics, not a validated one. Nothing in stages 3 or 4 depends
+    on the result: it sets plot polarity and the left/right naming of the
+    mediolateral axis, not any number computed.
     """
     a = np.asarray(user_accel, float)
     up = np.asarray(up, float) / np.linalg.norm(up)
@@ -343,25 +377,21 @@ def resolve_forward_sign(
     impact_consistent = bool(impact_votes[0] == impact_votes[1] != 0)
 
     # Both criteria want a NEGATIVE statistic for a correctly oriented axis;
-    # the primary (phase) criterion decides the flip.
+    # the phase criterion decides the flip.
     flip = phase > 0
     criteria_agree = bool(np.sign(phase) == np.sign(impact) != 0)
-
-    # |stat| < 0.1: the signature is under a tenth of the signal's own scale
-    # (impact) or a correlation too weak to trust (phase): a coin flip.
-    strong = abs(phase) >= 0.1 and abs(impact) >= 0.1
+    strong = abs(phase) >= FORWARD_SIGN_MIN_EFFECT
     return {
         "flip": bool(flip),
         "axis": -axis if flip else axis,
         "phase_effect_size": float(phase),
         "impact_effect_size": float(impact),
-        "braking_effect_size": float(phase),  # kept for existing consumers
         "split_half_consistent": phase_consistent,
         "impact_split_half_consistent": impact_consistent,
+        # Diagnostic only: see the docstring for why agreement with the
+        # impact statistic is not evidence at the centre of mass.
         "criteria_agree": criteria_agree,
-        "sign_confident": bool(
-            strong and criteria_agree and phase_consistent and impact_consistent
-        ),
+        "sign_confident": bool(strong and phase_consistent),
     }
 
 
@@ -414,7 +444,6 @@ def build_frame(
         "forward_well_conditioned": fwd_est["well_conditioned"],
         "f_step_hz_used": fwd_est["f_step_hz"],
         "forward_sign_flipped": sign["flip"],
-        "forward_braking_effect_size": sign["braking_effect_size"],
         "forward_phase_effect_size": sign["phase_effect_size"],
         "forward_impact_effect_size": sign["impact_effect_size"],
         "forward_sign_criteria_agree": sign["criteria_agree"],
@@ -440,6 +469,18 @@ def resolve(vectors: np.ndarray, frame: AnatomicalFrame) -> np.ndarray:
     In `tracking` mode the up component uses the per-sample gravity
     direction and the horizontal axes are re-projected into each sample's
     horizontal plane, so the returned triad is orthonormal at every sample.
+
+    Known limit of a gravity-only frame, stated rather than hidden: the
+    re-projection corrects pitch and roll wobble of the sensor (synthetic
+    error <= 0.002 g on every channel for 5 deg wobble) but cannot see a
+    rotation ABOUT the vertical, because gravity does not change under it.
+    A sensor that yaws relative to the direction of travel -- the pelvis
+    rotates by roughly +/-5-10 deg in the transverse plane once per stride
+    -- therefore leaks fore-aft acceleration into the mediolateral channel
+    by sin(yaw): about 13% of the true mediolateral RMS on a pelvis-like
+    synthetic, scaling with pace. Any mediolateral quantity derived here is
+    a proxy contaminated by that term until the yaw is estimated from the
+    gyro and removed.
     """
     v = np.asarray(vectors, float)
     if frame.mode == "static" or frame.up_series is None:
@@ -476,7 +517,9 @@ def vertical_component(
 
     Separate from `resolve` because it needs only gravity: it is available
     even when the horizontal split is untrustworthy, which on pocket data it
-    is. Positive = away from the earth.
+    is. Positive = away from the earth, for a kinematic-polarity input
+    (`loader.Trial.user_accel`, or a rotation rate, which needs no
+    conversion). See the module docstring.
     """
     v = np.asarray(vectors, float)
     if mode == "tracking":
@@ -597,6 +640,10 @@ def verify_vertical_periodicity(a_vert: np.ndarray, fs_hz: float) -> dict:
     interchangeable. A low value means the two steps of a stride produce
     genuinely different waveforms -- which is informative, not a failure,
     and is why acceptance is judged on stride regularity.
+
+    Both regularities are read from the *unbiased* autocorrelation
+    (`dsp.autocorrelation`) at the local maximum nearest each lag, so they
+    do not depend on record length or on the exact value of `f_step`.
     """
     a_vert = np.asarray(a_vert, float)
     pk = dsp.spectral_peak(a_vert, fs_hz)
@@ -613,16 +660,30 @@ def verify_vertical_periodicity(a_vert: np.ndarray, fs_hz: float) -> dict:
     # carries wideband sensor and impact-ringing noise that contributes only
     # to the lag-0 normaliser, deflating every other lag and turning the
     # index into a noise measurement rather than a periodicity measurement.
-    # The band keeps the fundamental and three harmonics -- ample waveform
-    # shape -- and is expressed as multiples of f_step so it is identical at
-    # any sample rate or cadence.
-    lo = 0.5 * f_step
+    # The band keeps the stride subharmonic (see SYMMETRY_BAND_LOW_MULTIPLE
+    # for why the low edge sits well below it), the fundamental and three
+    # harmonics -- ample waveform shape -- and is expressed as multiples of
+    # f_step so it is identical at any sample rate or cadence.
+    lo = SYMMETRY_BAND_LOW_MULTIPLE * f_step
     hi = min(4.0 * f_step, 0.4 * fs_hz)
     a_band = dsp.bandpass(a_vert, fs_hz, lo, hi) if hi > lo else a_vert
     lags, ac = dsp.autocorrelation(a_band, fs_hz, max_lag_s=3.0 * step_period)
 
     def _at(multiple: float) -> float:
-        return float(ac[int(np.argmin(np.abs(lags - multiple * step_period)))])
+        # The autocorrelation maximum nearest the expected lag, searched
+        # within +/- HARMONIC_REL_BW of a step period, rather than the
+        # single sample at exactly 1/f_step: the spectral estimate of
+        # f_step carries a few percent of error, and reading one sample
+        # off the peak of a 3 Hz autocorrelation at 50 Hz costs ~15% of
+        # its value for no reason. This is how Moe-Nilssen's regularity
+        # is defined -- the peak, not a fixed lag.
+        target = multiple * step_period
+        half = HARMONIC_REL_BW * step_period
+        m = (lags >= target - half) & (lags <= target + half)
+        if not m.any():
+            m = np.zeros_like(lags, dtype=bool)
+            m[int(np.argmin(np.abs(lags - target)))] = True
+        return float(ac[m].max())
 
     step_reg = _at(1.0)
     stride_reg = _at(2.0)

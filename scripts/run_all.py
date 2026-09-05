@@ -125,10 +125,11 @@ def print_verdicts(t: pd.DataFrame) -> None:
     print(f"  step symmetry index              median {t['step_symmetry_index'].median():.2f} "
           f"(range {t['step_symmetry_index'].min():.2f}-{t['step_symmetry_index'].max():.2f})")
 
-    print(f"  forward sign: criteria agree     {int(t['forward_sign_criteria_agree'].sum())}/{n}, "
-          f"confident {int(t['forward_sign_confident'].sum())}/{n}")
-    print(f"  steady motion outside bout       max {t['discarded_steady_s'].max():.0f} s, "
-          f"{int((t['n_steady_segments'] > 1).sum())}/{n} trials have >1 bout")
+    print(f"  forward sign confident (phase)   {int(t['forward_sign_confident'].sum())}/{n} "
+          f"(impact statistic agrees on {int(t['forward_sign_criteria_agree'].sum())}/{n}: a coin flip, not a gate)")
+    print(f"  bouts                            {int((t['n_steady_segments'] > 1).sum())}/{n} trials have >1 bout; "
+          f"pooled over {int(t['n_bouts_analysed'].max())} at most; "
+          f"unanalysed steady motion max {t['unanalysed_steady_s'].max():.0f} s")
 
     print("\n[stage 3] steps and cadence")
     print(f"  cadence                          {t['cadence_spm'].min():.1f}-{t['cadence_spm'].max():.1f} spm "
@@ -136,6 +137,13 @@ def print_verdicts(t: pd.DataFrame) -> None:
     print(f"  inside 150-190 spm               {int(t['cadence_in_band'].sum())}/{n}")
     print(f"  detector vs spectral estimate    ratio {t['detector_spectral_ratio'].min():.3f}-"
           f"{t['detector_spectral_ratio'].max():.3f}")
+    print(f"  stride-interval CV               median {t['cadence_cv'].median():.3f}, max {t['cadence_cv'].max():.3f}")
+    print(f"  irregular strides                median {100 * t['irregular_stride_fraction'].median():.1f}%, "
+          f"max {100 * t['irregular_stride_fraction'].max():.1f}%")
+    print(f"  cadence spread within bout       median {100 * t['cadence_spread_within_bout'].median():.1f}%, "
+          f"max {100 * t['cadence_spread_within_bout'].max():.1f}% (mixed-gait rule fires above 20%)")
+    print(f"  harmonic-ambiguous spectral peak {int(t['harmonic_ambiguous'].sum())}/{n} "
+          f"(subharmonic power ratio max {t['subharmonic_power_ratio'].max():.2f})")
     flagged = t[t["cadence_flagged"]]
     print(f"  flagged                          {len(flagged)}/{n}")
     for _, r in flagged.iterrows():
@@ -145,8 +153,7 @@ def print_verdicts(t: pd.DataFrame) -> None:
     print("\n[quality roll-up]")
     for verdict, cnt in t["quality_verdict"].value_counts().items():
         print(f"  {verdict:<14s}                   {cnt}/{n}")
-    for side, cnt in t["side_classification"].value_counts().items():
-        print(f"  side: {side[:40]:<40s} {cnt}/{n}")
+    print(f"  side classification              {t['side_classification'].iloc[0]}")
 
     print("\n[stage 4] left/right (EXPLORATORY -- no ground truth in this dataset)")
     print(f"  alternation at detected contact  median {t['alternation_consistency'].median():.3f}")
@@ -156,7 +163,10 @@ def print_verdicts(t: pd.DataFrame) -> None:
     print(f"  ... vs max-over-phase null       median {t['best_phase_surrogate_max_mean'].median():.3f}")
     print(f"  ... exceeds that null's p95      {int(t['best_phase_beats_surrogate_p95'].sum())}/{n}")
     print(f"  alternation range over phase     median {t['alternation_phase_range'].median():.3f}")
-    print("  NO ACCURACY IS CLAIMED: consistency is not correctness.")
+    print(f"  contact margin |v|/RMS < 0.25    median {100 * t['contact_margin_below_quarter_fraction'].median():.0f}% of steps")
+    print(f"  cluster d minus Gaussian floor   median {t['cluster_separation_d_excess'].median():+.2f}")
+    print("  NO ACCURACY IS CLAIMED: consistency is not correctness, and beating the")
+    print("  surrogate measures phase-locking to the detector, not laterality.")
 
     if "subject" in t and t["trial"].nunique() > 1:
         piv = t.pivot_table(index="subject", columns="trial", values="cadence_spm")

@@ -213,7 +213,7 @@ def test_min_steady_seconds_is_enforced_at_every_entry_point():
     assert np.isnan(summary["cadence_spm"]), "3 s record still reports a cadence"
 
     diag = steps.diagnose_cadence(
-        summary["cadence_spm"], 60 * f0, 0.64, summary["irregular_step_fraction"]
+        summary["cadence_spm"], 60 * f0, 0.64, summary["irregular_stride_fraction"]
     )
     assert diag["flagged"] is True
     assert diag["failure_attributed_to"] == "trial"
@@ -280,7 +280,7 @@ def test_rate_error_is_not_blamed_on_the_trial():
     check = steps.check_sample_rate(a_vert, 200.0)
     assert check["sample_rate_plausible"] is False
     diag = steps.diagnose_cadence(
-        summary["cadence_spm"], 60 * f0, 0.85, summary["irregular_step_fraction"],
+        summary["cadence_spm"], 60 * f0, 0.85, summary["irregular_stride_fraction"],
         sample_rate_plausible=check["sample_rate_plausible"],
         out_of_band_peak_hz=check["out_of_band_peak_hz"],
     )
@@ -390,21 +390,26 @@ def test_stride_lag_dominates_for_an_asymmetric_gait_signal():
     assert 0.0 < per["step_symmetry_index"] < 1.0
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: autocorrelation's docstring says 'unbiased-ish' but it is "
-    "the plain biased estimator -- ac(k) is scaled by (n-k)/n with no "
-    "correction. Because the stride lag is twice the step lag, stride "
-    "regularity is deflated about twice as much as step regularity, which "
-    "systematically inflates step_symmetry_index (their ratio).",
-)
 def test_autocorrelation_is_unbiased_as_documented():
+    """FIXED: was the plain biased estimator, ac(k) scaled by (n-k)/n.
+
+    Because the stride lag is twice the step lag, stride regularity was
+    deflated about twice as much as step regularity, which inflated
+    step_symmetry_index (their ratio) by the record length alone.
+    """
     fs_hz, f0_hz, n = 200.0, 2.5, 12000
     x = np.sin(2 * np.pi * f0_hz * np.arange(n) / fs_hz)
     lags, ac = dsp.autocorrelation(x, fs_hz, 3.0 / f0_hz)
     i = int(np.argmin(np.abs(lags - 1.0 / f0_hz)))
     # Exact lag alignment here, so any shortfall is the missing 1/(n-k).
     assert ac[i] == pytest.approx(1.0, abs=1e-6), f"ac(1T) = {ac[i]:.6f}"
+    # And it must not depend on the record length: 10 s reads the same as 60 s.
+    for seconds in (10.0, 60.0):
+        m = int(seconds * fs_hz)
+        _, ac_s = dsp.autocorrelation(x[:m], fs_hz, 3.0 / f0_hz)
+        assert ac_s[i] == pytest.approx(1.0, abs=1e-6), f"{seconds:.0f} s: ac(1T) = {ac_s[i]:.6f}"
+        j = int(round(2.0 / f0_hz * fs_hz))
+        assert ac_s[j] == pytest.approx(1.0, abs=1e-6), f"{seconds:.0f} s: ac(2T) = {ac_s[j]:.6f}"
 
 
 # --- stage 4 nulls --------------------------------------------------------
@@ -433,6 +438,8 @@ def test_alternation_rate_edge_cases():
     assert lateral.alternation_rate(np.array([1.0, 1.0, 1.0])) == 0.0
     # zeros cannot support a flip claim
     assert lateral.alternation_rate(np.array([0.0, 0.0, 0.0])) == 0.0
+    # FIXED: a NaN used to count silently as a non-flip on both sides
+    assert np.isnan(lateral.alternation_rate(np.array([1.0, -1.0, np.nan, -1.0, 1.0])))
 
 
 def test_surrogate_preserves_the_power_spectrum():

@@ -6,7 +6,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 
-from . import dsp, loader, orientation
+from . import dsp, loader, orientation, steps
 
 # A short window is used wherever individual steps must be visible: 6 s
 # shows ~17 steps at running cadence, enough to see the pattern and few
@@ -79,9 +79,10 @@ def plot_steady_state(result: dict):
         w = int(round(1.0 * tr.fs_hz))
         centres = (np.arange(len(seg["window_rms"])) + 0.5) * w / tr.fs_hz
         ax.plot(centres, seg["window_rms"], lw=1.6, color="C0", label="1 s window RMS")
+        thr = seg.get("threshold_g", 0.5 * np.median(seg["window_rms"]))
         ax.axhline(
-            0.5 * np.median(seg["window_rms"]), color="C3", ls="--", lw=1.2,
-            label="0.5 x median threshold",
+            thr, color="C3", ls="--", lw=1.2,
+            label=f"threshold {thr:.2f} g (0.5 x median, floor {steps.STEADY_RMS_FLOOR_G:g} g)",
         )
     ax.axvspan(
         seg["start"] / tr.fs_hz, seg["stop"] / tr.fs_hz, color="C2", alpha=0.15,
@@ -135,7 +136,9 @@ def plot_frame(result: dict):
     e1, e2 = orientation.horizontal_basis(fr.up)
     ax.scatter(accel @ e1, accel @ e2, s=2, alpha=0.25, color="0.5")
     lim = float(np.abs(np.c_[accel @ e1, accel @ e2]).max()) * 1.05
-    for vec, name, col in ((fr.forward, "forward", "C0"), (fr.mediolateral, "ML (left)", "C3")):
+    ml_name = "ML (left)" if fr.diagnostics.get("forward_sign_confident") else "ML (side unresolved)"
+    fwd_name = "forward" if fr.diagnostics.get("forward_sign_confident") else "forward (sign unresolved)"
+    for vec, name, col in ((fr.forward, fwd_name, "C0"), (fr.mediolateral, ml_name, "C3")):
         ax.arrow(
             0, 0, float(vec @ e1) * lim * 0.8, float(vec @ e2) * lim * 0.8,
             color=col, width=lim * 0.008, length_includes_head=True, label=name,
@@ -234,7 +237,7 @@ def plot_steps(result: dict, start_s: float = 0.0):
 
     cad = result["cadence_series"]
     axes[1].plot(cad["t_s"], cad["cadence_spm"], ".", ms=3, alpha=0.4, label="instantaneous")
-    axes[1].plot(cad["t_s"], cad["cadence_spm_smooth"], lw=1.8, color="C1", label="5-step median")
+    axes[1].plot(cad["t_s"], cad["cadence_spm_smooth"], lw=1.8, color="C1", label="6-interval median")
     axes[1].axhline(cs["cadence_spm"], color="C2", ls="-", label=f"trial {cs['cadence_spm']:.1f} spm")
     axes[1].axhline(
         result["spectral"]["cadence_spm"], color="C4", ls=":",

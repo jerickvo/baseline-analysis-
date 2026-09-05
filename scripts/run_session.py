@@ -47,12 +47,14 @@ def main() -> int:
     print(f"sampling     {tr.fs_hz:.2f} Hz measured, jitter {tr.integrity['jitter_ms']:.2f} ms, "
           f"gaps {tr.integrity['n_gaps']}, dropped ~{tr.integrity['n_dropped_estimate']}, "
           f"duration {tr.duration_s:.1f} s")
-    print(f"steady       {result['steady_seconds']:.1f} s analysed in {row['n_steady_segments']} bout(s), "
-          f"{row['discarded_steady_s']:.1f} s of steady motion outside the analysed bout")
+    print(f"steady       {row['steady_s_all_bouts']:.1f} s of running in {row['n_bouts_analysed']} bout(s) "
+          f"(longest {result['steady_seconds']:.1f} s); {row['unanalysed_steady_s']:.1f} s in bouts too short to analyse")
     print(f"frame        {row['frame_verdict']}  (forward sign confident: {row['forward_sign_confident']})")
-    print(f"cadence      {row['cadence_spm']:.1f} spm  (spectral {row['cadence_spm_spectral']:.1f})  "
+    print(f"cadence      {row['cadence_spm']:.1f} spm pooled over the bouts  (longest bout "
+          f"{row['cadence_spm_primary_bout']:.1f}, spectral {row['cadence_spm_spectral']:.1f})  "
           f"cause={row['cadence_failure_cause']}")
-    print(f"side (L/R)   {q['side_classification']}")
+    print(f"alternation  {row['alternation_consistency']:.2f} at the step marker vs {row['alternation_surrogate_null']:.2f} "
+          f"for its surrogate -- parity of an unanchored sign, NOT a left/right result")
     print(f"QUALITY      {q['verdict'].upper()}")
     for b in q["blockers"]:
         print(f"  blocker  {b}")

@@ -31,6 +31,23 @@ no left/right information by construction:
 If the real alternation rate does not beat the surrogate and mid-step
 controls, the sign sequence carries no more information than "omega_v has
 stride-rate power".
+
+What beating the surrogate does NOT show
+----------------------------------------
+The surrogate keeps the spectrum and randomises the phase, so it also
+destroys the one thing the real signal always has: phase-locking to the
+same gait cycle the steps were detected from. With realistic step-to-step
+jitter (the real-data stride CV is a few percent, the detected step
+intervals alternate by far more) a fixed-frequency surrogate drifts
+against the step times and its alternation falls to ~0.8-0.9, while ANY
+gait-locked stride-rate oscillation stays near 1.0 -- whether or not it
+carries left/right information. Measured: a fake omega_v built as
+cos(pi x step phase), a deterministic function of the detected step times
+alone, "beats the surrogate" on 11 of 12 real trials. Laterality IS a
+gait-locked stride-rate oscillation, so no signal-only null can separate
+the two. The excess over the surrogate therefore measures phase-locking
+to the detector, which the phone-leg's own motion produces by itself, and
+is never turned into a side verdict anywhere in this package.
 """
 
 from __future__ import annotations
@@ -56,6 +73,20 @@ N_SURROGATES = 200
 # non-flip in ten steps. This is a description of the sign sequence, NOT an
 # accuracy: see the module docstring.
 ALTERNATION_CONSISTENT_THRESHOLD = 0.90
+
+# Cohen's d between the positive and negative halves of a standard normal
+# sample: 2 * sqrt(2/pi) / sqrt(1 - 2/pi) = 2.647. Splitting ANY unimodal
+# distribution at its mode and measuring the gap between the halves gives
+# a d of this order, so `cluster_separation_d` is only evidence of two
+# clusters by its excess over this baseline. On MotionSense the median d
+# is 2.36 -- below the baseline, i.e. the at-contact values are unimodal
+# around zero.
+SIGN_SPLIT_D_GAUSSIAN = 2.0 * np.sqrt(2.0 / np.pi) / np.sqrt(1.0 - 2.0 / np.pi)
+
+# A contact sample whose magnitude is below this fraction of the signal's
+# RMS is a coin flip on timing error alone: the sign of a quantity read at
+# a quarter of its own scale changes with a one-sample shift of the window.
+LOW_MARGIN_FRACTION = 0.25
 
 
 def omega_vertical(
@@ -113,13 +144,38 @@ def alternation_rate(values: np.ndarray) -> float:
     """Fraction of consecutive step pairs whose sign flips.
 
     Zero-valued samples are treated as non-flips (they cannot support a
-    flip claim). Returns NaN with fewer than two samples.
+    flip claim). Returns NaN with fewer than two samples, and NaN for any
+    non-finite sample: `np.sign(nan)` is NaN and every comparison with it
+    is False, so a NaN used to count silently as a non-flip on both sides.
+
+    This is a lag-1 statistic. A run of k consecutive wrong labels inside
+    an alternating sequence costs exactly two non-flips for every k >= 1,
+    so one wrong label and forty wrong labels (a parity slip at the
+    midpoint) read the same; see `analyse` for the run-length diagnostics
+    that expose the difference.
     """
     v = np.asarray(values, float)
-    if len(v) < 2:
+    if len(v) < 2 or not np.all(np.isfinite(v)):
         return float("nan")
     s = np.sign(v)
     return float(np.mean(s[1:] * s[:-1] < 0))
+
+
+def longest_same_sign_run(values: np.ndarray) -> int:
+    """Longest run of consecutive contact samples with the same sign.
+
+    In a perfectly alternating sequence this is 1. A value of 2 marks one
+    non-flip; anything larger, or many 2s, marks a labelling that has
+    slipped parity and would average left with right if aggregated.
+    """
+    s = np.sign(np.asarray(values, float))
+    if s.size == 0:
+        return 0
+    longest = run = 1
+    for a, b in zip(s[:-1], s[1:]):
+        run = run + 1 if a == b else 1
+        longest = max(longest, run)
+    return int(longest)
 
 
 def label_alternating(values: np.ndarray) -> np.ndarray:
@@ -128,22 +184,32 @@ def label_alternating(values: np.ndarray) -> np.ndarray:
     Deliberately named A and B, not left and right. Assigning anatomical
     sides needs (a) ground truth this dataset does not contain and (b)
     knowledge of which pocket held the phone, which it also does not
-    contain.
+    contain. These labels are a parity sequence relative to an unknown
+    anchor, and one sign glitch inverts every label after it: they are
+    for plotting, and must not be aggregated per side.
     """
     s = np.sign(np.asarray(values, float))
     return np.where(s >= 0, "A", "B")
 
 
 def phase_randomised_surrogate(x: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    """A signal with x's exact power spectrum and randomised phases."""
+    """A signal with x's exact power spectrum and randomised phases.
+
+    The DC and (for even n) Nyquist bins keep their ORIGINAL phase, which
+    is 0 or pi, so they stay real and keep their sign. Forcing them to 0
+    made every surrogate's mean positive, which flipped the mean of a
+    negative-mean input (gyro bias, a runner curving). Harmless for the
+    sign-alternation statistics, which are invariant under global
+    negation, wrong for any mean-sensitive statistic run on surrogates.
+    """
     x = np.asarray(x, float)
     n = len(x)
     spec = np.fft.rfft(x)
     mag = np.abs(spec)
     phases = rng.uniform(0, 2 * np.pi, size=mag.shape)
-    phases[0] = 0.0  # keep DC real
+    phases[0] = np.angle(spec[0])
     if n % 2 == 0:
-        phases[-1] = 0.0  # keep Nyquist real
+        phases[-1] = np.angle(spec[-1])
     return np.fft.irfft(mag * np.exp(1j * phases), n)
 
 
@@ -324,15 +390,24 @@ def analyse(
     b = values[labels == "B"]
     if len(a) > 1 and len(b) > 1:
         pooled = np.sqrt((np.var(a, ddof=1) + np.var(b, ddof=1)) / 2.0)
-        # Cohen's d between the two sign groups. Note this is guaranteed to
-        # be positive by construction -- the groups are *defined* by sign --
-        # so it measures how far apart the clusters sit, never whether the
-        # split is real.
+        # Cohen's d between the two sign groups. Positive by construction
+        # -- the groups are *defined* by sign -- and large by construction
+        # too: iid Gaussian noise gives SIGN_SPLIT_D_GAUSSIAN. Only the
+        # excess over that baseline says anything about two clusters.
         separation = float(abs(a.mean() - b.mean()) / pooled) if pooled > 0 else np.inf
     else:
         separation = np.nan
 
     excess = rate - nulls["surrogate_mean"] if np.isfinite(nulls["surrogate_mean"]) else np.nan
+
+    # How well-conditioned each sign reading is: |value| relative to the
+    # signal's own RMS. The theory samples omega_v at the instant a
+    # stride-rate rotation reverses, i.e. near its zero crossing, so low
+    # margins are expected by construction, not only from placement.
+    rms = float(np.sqrt(np.mean(omega_v**2))) if len(omega_v) else np.nan
+    margins = np.abs(values) / rms if rms > 0 else np.full(len(values), np.nan)
+    s = np.sign(values)
+    n_non_flips = int(np.sum(s[1:] * s[:-1] >= 0)) if len(values) > 1 else 0
 
     return {
         "omega_v": omega_v,
@@ -346,8 +421,20 @@ def analyse(
         "alternation_consistent": bool(
             np.isfinite(rate) and rate >= ALTERNATION_CONSISTENT_THRESHOLD
         ),
+        "n_non_flips": n_non_flips,
+        "longest_same_sign_run": longest_same_sign_run(values),
+        "contact_margin_median": float(np.median(margins)) if len(margins) else np.nan,
+        "contact_margin_below_quarter_fraction": (
+            float(np.mean(margins < LOW_MARGIN_FRACTION)) if len(margins) else np.nan
+        ),
         "cluster_separation_d": separation,
+        "cluster_separation_d_excess": (
+            float(separation - SIGN_SPLIT_D_GAUSSIAN) if np.isfinite(separation) else np.nan
+        ),
         "balance_A_fraction": float(np.mean(labels == "A")) if len(labels) else np.nan,
+        # Excess over the phase-randomised null. Read the module docstring:
+        # this measures phase-locking to the step detector, which any
+        # gait-locked oscillation has, not laterality.
         "excess_over_surrogate": float(excess) if np.isfinite(excess) else np.nan,
         "best_phase_alternation": sweep["best_alternation"],
         "best_phase_offset_step_fraction": sweep["best_offset_step_fraction"],

@@ -156,7 +156,21 @@ def bandpass(
 
 
 def autocorrelation(x: np.ndarray, fs_hz: float, max_lag_s: float) -> tuple[np.ndarray, np.ndarray]:
-    """Unbiased-ish normalised autocorrelation, lag 0 .. max_lag_s."""
+    """Unbiased normalised autocorrelation, lag 0 .. max_lag_s.
+
+    The zero-padded FFT product at lag k is a sum over only n - k
+    overlapping terms, while lag 0 sums over all n. Dividing every lag by
+    its own term count before normalising removes the (n - k) / n taper
+    that the plain (biased) estimator carries, so a perfectly periodic
+    signal reads 1.0 at its period regardless of record length. Without
+    the correction a 10 s record at 2.7 Hz read 0.93 at the stride lag, and
+    because the stride lag is twice the step lag the ratio of the two --
+    the symmetry index -- was biased upward by the record length alone.
+
+    The unbiased estimate can exceed 1 in magnitude at lags approaching n
+    on noisy input; callers keep `max_lag_s` a small multiple of the
+    period, far from that regime.
+    """
     x = np.asarray(x, dtype=float)
     x = x - x.mean()
     n = len(x)
@@ -165,6 +179,7 @@ def autocorrelation(x: np.ndarray, fs_hz: float, max_lag_s: float) -> tuple[np.n
     nfft = 1 << int(np.ceil(np.log2(2 * n)))
     fx = np.fft.rfft(x, nfft)
     ac = np.fft.irfft(fx * np.conj(fx), nfft)[: max_lag + 1]
+    ac = ac / (n - np.arange(max_lag + 1))  # mean product per lag, not the sum
     denom = ac[0] if ac[0] != 0 else 1.0
     ac = ac / denom
     lags = np.arange(max_lag + 1) / fs_hz
