@@ -612,6 +612,29 @@ def check_timestamps(t: np.ndarray, gap_multiple: float = GAP_INTERVAL_MULTIPLE)
     }
 
 
+# Skew between the app's two clocks above which the GPS and motion streams
+# can no longer be treated as aligned. gps.csv rows are ~1 s apart, so a
+# skew under half a row is below what the GPS stream itself could resolve.
+MAX_WALL_UPTIME_SKEW_S = 0.5
+
+
+def wall_uptime_skew(metadata: dict) -> float:
+    """(endTime - startTime) on the wall clock minus durationSeconds on the
+    uptime clock. Motion and accel `t` ride the uptime clock, gps.csv `t`
+    the wall clock; the two share an origin, so any skew that accumulates
+    (an NTP step, a pause of the uptime clock) shows up here and nowhere
+    else. NaN when the fields are missing or unparseable."""
+    try:
+        start = pd.Timestamp(metadata["startTime"])
+        end = pd.Timestamp(metadata["endTime"])
+        duration = float(metadata["durationSeconds"])
+    except (KeyError, TypeError, ValueError):
+        return float("nan")
+    if pd.isna(start) or pd.isna(end):
+        return float("nan")
+    return float((end - start).total_seconds() - duration)
+
+
 def load_logger_gps(folder: str | Path) -> tuple[pd.DataFrame, dict]:
     """gps.csv with the rows no analysis should see removed, and a count of them.
 
@@ -775,6 +798,7 @@ def load_logger_session(
         integrity["metadata_count_matches"] = (int(n_meta) == n_rows_written) if n_meta is not None else None
         integrity["metadata_in_progress"] = bool(metadata.get("inProgress", False))
         integrity["metadata_event_markers"] = metadata.get("eventMarkers") or []
+        integrity["wall_uptime_skew_s"] = wall_uptime_skew(metadata)
     problems = [p for p in [integrity["problems"]] if p]
     if metadata is not None:
         rows_lost = integrity.get("metadata_rows_lost") or 0

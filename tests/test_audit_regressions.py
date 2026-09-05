@@ -496,3 +496,121 @@ def test_coarse_gps_is_a_caveat(tmp_path):
     q = result["quality"]
     assert q["verdict"] == "partial", q["summary"]
     assert any("GPS fixes are coarse" in c for c in q["caveats"])
+
+
+# --- round-2 verifier residuals ---------------------------------------------
+
+
+def test_wall_uptime_skew_is_reported_and_flagged(tmp_path):
+    anat = synthetic_anatomical(seconds=30.0)
+    folder = write_logger_session(tmp_path / "skew", anat, np.eye(3))
+    tr = loader.load_logger_session(folder)
+    assert abs(tr.integrity["wall_uptime_skew_s"]) < 1e-6 or np.isfinite(tr.integrity["wall_uptime_skew_s"])
+    meta = json.loads((folder / "session.json").read_text())
+    # The wall clock says the session lasted 3 s longer than the uptime clock.
+    meta["endTime"] = "2026-09-03T12:00:33Z"
+    meta["startTime"] = "2026-09-03T12:00:00Z"
+    meta["durationSeconds"] = 30.0
+    (folder / "session.json").write_text(json.dumps(meta))
+    result = pipeline.run_session(folder)
+    assert abs(result["trial"].integrity["wall_uptime_skew_s"] - 3.0) < 1e-6
+    assert any("wall clock and uptime clock disagree" in c for c in result["quality"]["caveats"])
+
+
+def test_strong_harmonic_on_a_measured_rate_session_is_a_suspect_not_a_rate_error(tmp_path):
+    """On a logger session the rate is measured, so the spectral rate check
+    cannot mean 'wrong rate'. A second harmonic stronger than the
+    fundamental must be reported as such and must not refuse the run."""
+    anat = synthetic_anatomical(seconds=60.0)
+    n = len(anat["t"])
+    w = 2 * np.pi * F_STEP_HZ * anat["t"]
+    # Overwrite the vertical channel with a dominant second harmonic.
+    anat["accel"][:, 2] = 0.6 * np.sin(w) + 1.0 * np.sin(2 * w + 0.4) + 0.05 * np.random.default_rng(0).normal(size=n)
+    folder = write_logger_session(tmp_path / "harm", anat, np.eye(3))
+    result = pipeline.run_session(folder)
+    rc, cd = result["sample_rate_check"], result["cadence_diagnosis"]
+    assert rc["sample_rate_plausible"] is False, "the scenario no longer trips the spectral check"
+    assert cd["rate_is_measured"] is True
+    assert cd["harmonic_suspect"] is True
+    assert cd["failure_attributed_to"] == "trial"
+    q = result["quality"]
+    assert q["verdict"] != "insufficient", q["summary"]
+    assert any("out-of-band line" in c for c in q["caveats"]), q["caveats"]
+
+
+def test_implausible_cadence_on_a_measured_rate_session_is_refused_as_such(tmp_path):
+    anat = synthetic_anatomical(seconds=60.0, f_step_hz=4.0)  # 240 spm
+    folder = write_logger_session(tmp_path / "sprint", anat, np.eye(3))
+    result = pipeline.run_session(folder)
+    cd = result["cadence_diagnosis"]
+    assert cd["implausible_cadence"] is True
+    assert cd["failure_attributed_to"] == "trial"
+    q = result["quality"]
+    assert q["verdict"] == "insufficient"
+    assert any("implausible cadence" in b for b in q["blockers"]), q["blockers"]
+
+
+def test_analysed_fraction_counts_every_bout(tmp_path):
+    a = synthetic_anatomical(seconds=60.0, seed=0)
+    b = synthetic_anatomical(seconds=40.0, seed=1)
+    joined = _join([_still(5.0), a, _still(20.0, seed=7), b, _still(5.0, seed=6)])
+    folder = write_logger_session(tmp_path / "frac", joined, np.eye(3))
+    row = pipeline.flatten(pipeline.run_session(folder))
+    assert row["n_bouts_analysed"] == 2
+    assert 0.74 < row["analysed_fraction"] < 0.80  # 100 s of 130 s
+    assert row["analysed_fraction"] > row["steady_s"] / 130.0 + 0.2  # more than the longest bout alone
+
+
+def test_nan_cadence_is_reported_once(tmp_path):
+    """The NaN blocker used to be echoed as a mislabelled caveat too."""
+    joined = _join([_still(10.0), synthetic_anatomical(seconds=5.2, seed=2), _still(10.0, seed=6)])
+    folder = write_logger_session(tmp_path / "once", joined, np.eye(3), jitter_s=0.0)
+    q = pipeline.run_session(folder)["quality"]
+    assert sum("no defensible cadence" in b for b in q["blockers"]) == 1
+    assert not any("no defensible cadence" in c for c in q["caveats"]), q["caveats"]
+    assert not any("cadence outside the expected band" in c for c in q["caveats"]), q["caveats"]
+
+
+def _splice(subject: int) -> loader.Trial:
+    """A real walking trial followed by the same subject's real jog trial,
+    steady parts only, as one record: the warm-up-walk case at a pocket."""
+    import pandas as pd
+
+    def steady(tr):
+        seg = steps.steady_state_segment(np.linalg.norm(tr.user_accel, axis=1), tr.fs_hz)
+        return tr.df.iloc[seg["start"]:seg["stop"]]
+
+    walk = loader.load_trial("wlk", 7, subject)
+    jog = loader.load_trial("jog", 9, subject)
+    df = pd.concat([steady(walk), steady(jog)], ignore_index=True)
+    df.index = pd.Index(np.arange(len(df)) / jog.fs_hz, name="t_s")
+    return loader.Trial(
+        ident=loader.TrialID("walk_then_jog", 0, subject), fs_hz=jog.fs_hz, df=df,
+        path=jog.path, integrity=dict(jog.integrity),
+    )
+
+
+@pytest.mark.parametrize(
+    "subject",
+    [
+        pytest.param(1, marks=pytest.mark.xfail(strict=True, reason=(
+            "KNOWN LIMIT: walking at ~2/3 of running cadence is counted at the running "
+            "rate by a detector band-passed around the running fundamental; the spread "
+            "reads 0.17, under the 0.20 rule. See MIXED_CADENCE_SPREAD."))),
+        pytest.param(2, marks=pytest.mark.xfail(strict=True, reason="KNOWN LIMIT: spread 0.19, see subject 1")),
+        3, 4, 5,
+        pytest.param(6, marks=pytest.mark.xfail(strict=True, reason="KNOWN LIMIT: spread 0.20 exactly, see subject 1")),
+        pytest.param(7, marks=pytest.mark.xfail(strict=True, reason="KNOWN LIMIT: spread 0.11, see subject 1")),
+        8,
+    ],
+)
+def test_a_real_walk_merged_into_a_real_run_is_called_more_than_one_gait(subject):
+    """Round-2 verifier residual, on real data. A pocket walk carries ~0.5x
+    running RMS, right at the running-state threshold, so on these subjects
+    it is admitted into the running bout. The mixed-gait rule must then
+    refuse the bout rather than report one cadence for two gaits."""
+    result = pipeline.run_stages(_splice(subject))
+    assert result["segment"]["n_segments"] <= 2
+    cd = result["cadence_diagnosis"]
+    assert cd["mixed_gait"] is True, (subject, cd["cadence_spread"])
+    assert result["quality"]["verdict"] == "insufficient"

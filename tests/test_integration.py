@@ -135,10 +135,17 @@ def write_logger_session(
         for k in range(int(anat["t"][-1])):
             f.write("%.6f,%.6f,%.6f,%.3f,%.2f,%.2f,%.3f,%.2f\n" % (
                 k, 37.42 + k * 1e-5, -122.08, 3.3, gps_accuracy_m, 10.0, 0.3, 4.0))
+    import datetime as _dt
+    start = _dt.datetime(2026, 9, 3, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    duration = float(t[-1] - t[0])
+    end = start + _dt.timedelta(seconds=duration)
     meta = {
         "id": "synthetic", "label": "synthetic 3mi",
-        "startTime": "2026-09-03T12:00:00Z", "endTime": "2026-09-03T12:01:30Z",
-        "durationSeconds": float(t[-1] - t[0]),
+        # Wall-clock end and uptime duration agree here, as on a phone whose
+        # clocks did not drift; a test that wants skew edits the file.
+        "startTime": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "endTime": end.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        "durationSeconds": duration,
         "motionSampleCount": n, "accelSampleCount": 0, "gpsSampleCount": int(anat["t"][-1]),
         "achievedMotionHz": n / float(t[-1] - t[0]), "achievedAccelHz": 0.0,
         "deviceModel": "synthetic", "iosVersion": "16.0",
@@ -301,9 +308,10 @@ def test_frame_recovers_the_true_axes_from_any_placement(name, R):
     assert dsp.angle_between_deg(frame.up, R @ anat["up"]) < 0.5, name
     assert dsp.axis_angle_deg(frame.forward, R @ anat["forward"]) < 3.0, name
     # Confidence comes from the phase criterion alone. The impact
-    # statistic samples fore-aft at its own zero crossing on a
-    # centre-of-mass signal, so its sign is set by noise and rotation
-    # residuals and its agreement is a coin flip: deliberately NOT asserted.
+    # statistic measures where the vertical peak sits relative to the
+    # fore-aft zero crossing, not the orientation, so on a centre-of-mass
+    # signal its sign is a property of the stance shape: deliberately NOT
+    # asserted.
     assert frame.diagnostics["forward_sign_confident"], name
     assert abs(frame.diagnostics["forward_phase_effect_size"]) > 0.5, name
     assert dsp.angle_between_deg(frame.forward, R @ anat["forward"]) < 3.0, (
@@ -449,8 +457,13 @@ def test_a_run_split_by_a_stop_is_pooled_not_halved(tmp_path):
     assert row["n_bouts_analysed"] == 2
 
 
-def test_quality_is_insufficient_when_the_rate_is_lied_about(tmp_path):
-    """A logger session's rate is measured, so lie in the file itself."""
+def test_quality_is_insufficient_when_the_timestamps_lie(tmp_path):
+    """A logger session's rate is measured, so lie in the file itself.
+
+    With a measured rate the cause cannot be called `sample_rate`: what the
+    pipeline can say is that 672 spm is not a running cadence, and that a
+    timestamp column in the wrong units is one way to get there.
+    """
     anat = synthetic_anatomical(seconds=60.0)
     folder = write_logger_session(tmp_path / "lied", anat, np.eye(3), jitter_s=0.0)
     lines = (folder / "motion.csv").read_text().splitlines()
@@ -459,8 +472,19 @@ def test_quality_is_insufficient_when_the_rate_is_lied_about(tmp_path):
     body = [",".join([f"{i / 400.0:.6f}"] + row.split(",")[1:]) for i, row in enumerate(body)]
     (folder / "motion.csv").write_text("\n".join([head] + body) + "\n")
     result = pipeline.run_session(folder)
-    assert result["cadence_diagnosis"]["failure_attributed_to"] == "sample_rate"
-    assert result["quality"]["verdict"] == "insufficient"
+    cd = result["cadence_diagnosis"]
+    assert cd["rate_is_measured"] is True
+    assert cd["failure_attributed_to"] != "sample_rate"
+    # The gait now sits at 11 Hz, outside the plausible band: the spectral
+    # check reports the out-of-band line, and the vertical channel has no
+    # in-band periodicity, which is what refuses the record.
+    assert cd["harmonic_suspect"] is True
+    assert "outside the plausible step band" in cd["diagnosis"]
+    q = result["quality"]
+    assert q["verdict"] == "insufficient", q["summary"]
+    assert any("no repeating gait structure" in b for b in q["blockers"]), q["blockers"]
+    assert not any("more than one gait" in b for b in q["blockers"]), q["blockers"]
+    assert cd["mixed_gait"] is False
 
 
 def test_side_classification_is_never_a_gate(tmp_path):

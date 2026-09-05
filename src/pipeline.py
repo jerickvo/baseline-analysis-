@@ -114,6 +114,8 @@ def run_stages(
         cadence_spread=steps.cadence_spread(cadence),
         harmonic_ambiguous=spectral["harmonic_ambiguous"],
         subharmonic_power_ratio=spectral["subharmonic_power_ratio"],
+        rate_is_measured=bool(tr.integrity.get("has_timestamp_column", False)),
+        out_of_band_multiple=rate_check["out_of_band_multiple"],
     )
     # `cadence_summary` already enforces MIN_STEADY_SECONDS on the step
     # span; this adds the segment-level context to the message.
@@ -358,7 +360,7 @@ def assess_quality(result: dict) -> dict:
     ):
         # Reachable when the bout clears MIN_STEADY_SECONDS but the step
         # span inside it does not (a 5.2 s bout holds a ~4.9 s span).
-        blockers.append(f"no defensible cadence: {cd['diagnosis']}")
+        blockers.append(cd["diagnosis"])
     if pooled.get("bout_cadence_spread", 0.0) > steps.MIXED_CADENCE_SPREAD:
         cads = ", ".join(f"{c:.0f}" for c in pooled.get("bout_cadences_spm", []))
         blockers.append(
@@ -382,8 +384,23 @@ def assess_quality(result: dict) -> dict:
         # The axes are supported but not their direction: a 180-degree
         # error in forward maps left onto right exactly.
         caveats.append("forward sign unresolved: forward/back and left/right labels are undirected")
-    if cd["failure_attributed_to"] == "trial" and not result["steady_too_short"] and not cd.get("mixed_gait", False):
-        caveats.append(f"cadence outside the expected band: {cd['diagnosis']}")
+    if (
+        cd["failure_attributed_to"] == "trial"
+        and not result["steady_too_short"]
+        and not cd.get("mixed_gait", False)
+        and np.isfinite(cs["cadence_spm"])
+        and not cd.get("implausible_cadence", False)
+    ):
+        label = "unusually strong out-of-band line" if cd.get("harmonic_suspect") else "cadence outside the expected band"
+        caveats.append(f"{label}: {cd['diagnosis']}")
+    if cd.get("implausible_cadence", False):
+        blockers.append(f"implausible cadence: {cd['diagnosis']}")
+    skew = integ.get("wall_uptime_skew_s", np.nan)
+    if np.isfinite(skew) and abs(skew) > loader.MAX_WALL_UPTIME_SKEW_S:
+        caveats.append(
+            f"the app's wall clock and uptime clock disagree by {skew:+.2f} s over the session: "
+            f"gps.csv and motion.csv are not aligned to better than that"
+        )
     gps_acc = integ.get("gps_accuracy_median_m", np.nan)
     if np.isfinite(gps_acc) and gps_acc > loader.GPS_COARSE_ACCURACY_M:
         caveats.append(
@@ -434,6 +451,12 @@ def flatten(result: dict) -> dict:
         "trimmed_start_s": result["segment"]["trimmed_start_s"],
         "trimmed_end_s": result["segment"]["trimmed_end_s"],
         "steady_s": result["steady_seconds"],
+        # Share of the record analysed across all bouts; `kept_fraction`
+        # in the segment dict is the longest bout's share alone.
+        "analysed_fraction": (
+            pooled.get("steady_s_all_bouts", result["steady_seconds"]) / tr.duration_s
+            if tr.duration_s > 0 else np.nan
+        ),
         "steady_threshold_g": result["segment"].get("threshold_g", np.nan),
         "no_motion": result["segment"].get("no_motion", False),
         "n_steady_segments": result["segment"].get("n_segments", 1),

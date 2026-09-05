@@ -155,9 +155,25 @@ REGULAR_STRIDE_BAND = (0.7, 1.3)
 # Above this spread of the smoothed cadence series inside one bout -- the
 # 90th minus the 10th percentile, as a fraction of the median -- the bout
 # holds more than one gait and no single cadence describes it. Steady
-# running varies a few percent over a run (measured on the 48 MotionSense
-# trials, see the REPORT), a hard/easy interval session about 12%, and
-# walking merged into a running bout is a 30-50% jump. 0.2 sits between.
+# running varies a few percent over a run (5.6% median, 11.6% max on the
+# 48 MotionSense trials), a hard/easy interval session about 12%, and a
+# synthetic walk merged into a running bout is a 30-50% jump. 0.2 sits
+# between.
+#
+# Known limit, measured on real data: a real MotionSense walk spliced
+# ahead of the same subject's jog is caught on 4 of 8 subjects. On the
+# other 4 the detector -- band-passed around the RUNNING fundamental --
+# counts walking's stride harmonics at close to the running rate, so the
+# spread reads 0.11-0.19: the cadence comes out within a few percent of
+# the run's, but the walking seconds are counted as running steps. Two
+# detector-independent rules were tried and fail on the same data for the
+# same reason: walking cadence is typically two thirds of running cadence,
+# so walking's 2nd and 3rd stride harmonics land on 1.5x and 1.0x the
+# running fundamental, which defeats any spectral-peak or band-power rule;
+# and within-bout amplitude bimodality (window RMS p10/p90) overlaps
+# between steady runs (min 0.47) and splices (0.31-0.57). At the trunk,
+# walking is roughly 0.3x running RMS and is excluded by the running-state
+# rule instead; at a pocket it is ~0.5x, right at that rule's threshold.
 MIXED_CADENCE_SPREAD = 0.20
 # Cadence above which the sample rate, not the runner, is the prime
 # suspect. Distance runners top out near 200 spm; only sprinting exceeds
@@ -391,12 +407,19 @@ def check_sample_rate(
         out_peak, out_hz = 0.0, float("nan")
 
     ratio = out_peak / in_peak if in_peak > 0 else float("inf")
+    in_hz = float(pk["f_peak_hz"])
     return {
-        "in_band_peak_hz": float(pk["f_peak_hz"]),
+        "in_band_peak_hz": in_hz,
         "in_band_peak_power": in_peak,
         "out_of_band_peak_hz": out_hz,
         "out_of_band_peak_power": out_peak,
         "out_of_band_ratio": float(ratio),
+        # Where the strongest out-of-band line sits relative to the in-band
+        # peak. An integer or half-integer multiple is what a gait harmonic
+        # gives -- and also what a 2x-overstated rate gives (the true
+        # fundamental at exactly 2.0x the stride subharmonic), so this is
+        # reported to make the diagnosis legible, not used to excuse it.
+        "out_of_band_multiple": float(out_hz / in_hz) if in_hz > 0 and np.isfinite(out_hz) else float("nan"),
         "sample_rate_plausible": bool(ratio <= SAMPLE_RATE_OUT_OF_BAND_RATIO),
         "fs_hz": float(fs_hz),
     }
@@ -724,6 +747,8 @@ def diagnose_cadence(
     cadence_spread: float = np.nan,
     harmonic_ambiguous: bool = False,
     subharmonic_power_ratio: float = np.nan,
+    rate_is_measured: bool = False,
+    out_of_band_multiple: float = np.nan,
 ) -> dict:
     """Flag out-of-band cadence and attribute the cause.
 
@@ -753,16 +778,43 @@ def diagnose_cadence(
       peak reports the dominant one, and the pooled number is a mix of the
       two. That used to be attributed to the detector; it is a fact about
       the record, and no single cadence describes it.
+
+    `rate_is_measured` changes what a failed spectral rate check and a
+    cadence above the ceiling mean. On a logger session the rate comes from
+    hardware timestamps, so neither can be a rate error: the first is an
+    unusually strong out-of-band line (a harmonic stronger than the
+    fundamental, or a non-gait signal) and is reported as a suspect, not a
+    blocker; the second is an implausible cadence for distance running --
+    sprinting, or the detector counting a harmonic -- and is refused as
+    such. Both keep the cause "trial".
     """
     in_band = bool(expected[0] <= detected_spm <= expected[1])
     ratio = detected_spm / spectral_spm if spectral_spm > 0 else np.nan
     agree = bool(abs(ratio - 1.0) <= DETECTOR_SPECTRAL_TOLERANCE)
-    mixed = bool(np.isfinite(cadence_spread) and cadence_spread > MIXED_CADENCE_SPREAD)
+    spread_high = bool(np.isfinite(cadence_spread) and cadence_spread > MIXED_CADENCE_SPREAD)
+    # Set only by the branch that reaches it, so the flag and the message
+    # never disagree: a spread above the rule on a record already refused
+    # for a wrong rate or no periodicity is that failure, not a second one.
+    mixed = False
 
-    if not sample_rate_plausible:
+    harmonic_suspect = False
+    implausible = False
+    mult = (
+        f" at {out_of_band_multiple:.2f}x the in-band peak" if np.isfinite(out_of_band_multiple) else ""
+    )
+    if not sample_rate_plausible and rate_is_measured:
+        cause = "trial"
+        harmonic_suspect = True
+        detail = (
+            f"strongest spectral line sits outside the plausible step band "
+            f"({out_of_band_peak_hz:.2f} Hz{mult}). The rate is measured from timestamps, "
+            f"so this is not a rate error: a harmonic stronger than the fundamental, or a "
+            f"non-gait signal. Cadence reported; read it with that in mind."
+        )
+    elif not sample_rate_plausible:
         cause = "sample_rate"
         where = (
-            f" (strongest power sits at {out_of_band_peak_hz:.2f} Hz, outside the "
+            f" (strongest power sits at {out_of_band_peak_hz:.2f} Hz{mult}, outside the "
             f"plausible step band)" if out_of_band_peak_hz is not None else ""
         )
         detail = (
@@ -790,12 +842,22 @@ def diagnose_cadence(
             f"of its power, so the picked peak may be a second harmonic and the "
             f"detector, seeded by it, may be counting a harmonic"
         )
-    elif mixed:
+    elif spread_high:
         cause = "trial"
+        mixed = True
         detail = (
             f"mixed cadences within the bout: the smoothed cadence spans "
             f"{100 * cadence_spread:.0f}% of its median (p10 to p90); walking merged "
             f"with running? No single cadence describes this bout"
+        )
+    elif detected_spm > PLAUSIBLE_CADENCE_MAX_SPM and rate_is_measured:
+        cause = "trial"
+        implausible = True
+        detail = (
+            f"{detected_spm:.0f} spm is above the {PLAUSIBLE_CADENCE_MAX_SPM:.0f} spm "
+            f"ceiling for distance running, with a rate measured from timestamps: "
+            f"sprinting, the detector counting a harmonic, or a timestamp column that "
+            f"is not in seconds"
         )
     elif detected_spm > PLAUSIBLE_CADENCE_MAX_SPM:
         cause = "sample_rate"
@@ -842,6 +904,9 @@ def diagnose_cadence(
         "cadence_spread": float(cadence_spread),
         "mixed_gait": mixed,
         "harmonic_ambiguous": bool(harmonic_ambiguous),
+        "harmonic_suspect": harmonic_suspect,
+        "implausible_cadence": implausible,
+        "rate_is_measured": bool(rate_is_measured),
         # "none" | "sample_rate" | "algorithm" | "trial"
         "failure_attributed_to": cause,
         "diagnosis": detail,

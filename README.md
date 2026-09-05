@@ -38,7 +38,7 @@ export MOTIONSENSE_ROOT=$PWD/data/motion-sense/data   # or leave unset; the load
 python scripts/run_session.py <session_folder>   # one BaselineLogger session -> quality verdict
 python scripts/run_all.py                          # all 48 MotionSense trials -> reports/*.csv + verdict summary
 python scripts/run_invariance_checks.py            # rotation + resample sweep
-python -m pytest tests/                            # 138 tests, incl. ground-truth frame recovery
+python -m pytest tests/                            # 147 tests, incl. ground-truth frame recovery
 jupyter notebook notebooks/gait_pipeline_walkthrough.ipynb
 ```
 

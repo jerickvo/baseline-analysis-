@@ -79,8 +79,8 @@ ALTERNATION_CONSISTENT_THRESHOLD = 0.90
 # distribution at its mode and measuring the gap between the halves gives
 # a d of this order, so `cluster_separation_d` is only evidence of two
 # clusters by its excess over this baseline. On MotionSense the median d
-# is 2.36 -- below the baseline, i.e. the at-contact values are unimodal
-# around zero.
+# is 3.0 at the step marker (2.4 before the polarity fix moved the marker
+# from mid-flight to mid-stance), an excess of only 0.36 over the floor.
 SIGN_SPLIT_D_GAUSSIAN = 2.0 * np.sqrt(2.0 / np.pi) / np.sqrt(1.0 - 2.0 / np.pi)
 
 # A contact sample whose magnitude is below this fraction of the signal's
@@ -446,9 +446,10 @@ def analyse(
             sweep["best_alternation"] - sweep_null["max_mean"]
             if np.isfinite(sweep_null["max_mean"]) else np.nan
         ),
-        # The only defensible verdict for the best-phase result: does it
-        # exceed what the same procedure extracts from a signal with an
-        # identical spectrum and no laterality information at all?
+        # Does the best-phase result exceed what the same procedure
+        # extracts from a signal with an identical spectrum and random
+        # phase? A diagnostic only: any gait-locked oscillation beats this
+        # null (module docstring), so it is never a verdict.
         "best_phase_beats_surrogate_p95": bool(
             np.isfinite(sweep_null["max_p95"])
             and sweep["best_alternation"] > sweep_null["max_p95"]

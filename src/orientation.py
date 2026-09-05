@@ -323,15 +323,17 @@ def resolve_forward_sign(
 
     ``impact`` (reported only; it does NOT gate confidence)
         Fore-aft acceleration should be negative *at* the vertical peak.
-        That is valid where the peak is early stance, and at the centre of
-        mass -- where the peak is midstance -- it samples fore-aft at its
-        own zero crossing. Measured: on centre-of-mass synthetics its
-        statistic is within +/-0.012 under 16 rotations, i.e. its sign is
-        noise; on the pocket data it comes out negative on 24 of 48 trials,
-        a coin flip. Gating confidence on agreement with a null statistic
-        made "confident" unreachable at the production placement and turned
-        a correct phase answer into "criteria disagree" at random, which is
-        why the gate was removed.
+        After band-limiting, the statistic is the mean fore-aft over the
+        top quartile of vertical, so what it measures is how far the
+        vertical peak leads or lags the braking-to-propulsion zero
+        crossing. At a thigh that lead is large; at the centre of mass --
+        where the peak is midstance -- it is small and of uncertain sign:
+        a symmetric stance gives |stat| <= 0.011, a 10% lead gives +0.14,
+        and a few percent either way flips it. On the pocket data it comes
+        out negative on 24 of 48 trials, a coin flip; at the sacrum it
+        would flicker between "confident" and "disagree" across runners
+        for the same correct axis. Gating confidence on a marginal
+        statistic is why the gate was removed.
 
     Confidence therefore means: the phase correlation is at least
     `FORWARD_SIGN_MIN_EFFECT` in magnitude and has the same sign on both
@@ -720,7 +722,11 @@ def verify_frame(
 ) -> dict:
     """Run every stage-2 check and return one verdict plus the evidence.
 
-    `verdict` is deliberately three-valued. "ok" means every check passed.
+    `verdict` is deliberately three-valued. "ok" means the axes are
+    supported: periodicity, conditioning and the mediolateral cross-check
+    all pass. The forward SIGN is reported separately (in `reasons` and in
+    `frame.diagnostics["forward_sign_confident"]`) and does not enter the
+    verdict; the quality roll-up turns an unresolved sign into a caveat.
     "vertical_only" means the vertical axis is sound and periodic but the
     horizontal split is not supported -- downstream code may use vertical
     acceleration and must not use forward/ML. "failed" means the vertical
